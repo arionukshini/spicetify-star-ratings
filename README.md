@@ -22,6 +22,7 @@ Settings, such as enabling/disabling half star ratings, can be accessed from the
 - [x] configurable weighting (linear/exponential)
 - [x] creating weigthed playlist
 - [x] rating averaging over time
+- [x] album ratings averaged from rated songs
 - [] option to show rateyourmusic ratings
 - [] option to upload ratings to rateyourmusic (they only do albums)
 
@@ -41,6 +42,13 @@ The canonical rating (used for display and random sampling) is calculated using 
 
 As a safeguard and to allow ad-hoc changes of mind, any re-ratings within a five minute window behave like a non-averaged rating:
 If the new rating is the same as the old one, the old rating is removed. If they are different, the new rating replaces the old one.
+
+## Album Ratings
+
+On an album page, the extension shows an album rating below the album name.
+It is the average of the canonical ratings for the album's rated songs only;
+unrated songs do not count. Albums with no rated songs do not show an album
+rating.
 
 ## Star Rating Playlist Images
 

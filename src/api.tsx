@@ -58,13 +58,72 @@ export async function createFolder(name: string) {
     await getRootlistAPI().createFolder(name, { before: "" });
 }
 
-export async function getAlbum(uri: string) {
-    const query = {
-        offset: 0,
-        limit: 450,
-    };
+function getAlbumTrackItems(album: any): any[] {
+    if (Array.isArray(album?.tracks?.items)) return album.tracks.items;
+    if (Array.isArray(album?.tracks)) return album.tracks;
+    if (Array.isArray(album?.items)) return album.items;
 
-    return await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/albums/${uri}`, query);
+    // Spotify's in-client album endpoint (the endpoint recommended in the
+    // current Spicetify documentation) groups tracks by disc.
+    if (Array.isArray(album?.discs)) {
+        return album.discs.flatMap((disc: any) => (Array.isArray(disc?.tracks) ? disc.tracks : []));
+    }
+
+    return [];
+}
+
+function withAlbumTracks(album: any): any {
+    const items = getAlbumTrackItems(album);
+    return {
+        ...album,
+        tracks: {
+            ...(album?.tracks && !Array.isArray(album.tracks) ? album.tracks : {}),
+            items,
+            total: typeof album?.tracks?.total === "number" ? album.tracks.total : items.length,
+            offset: 0,
+            limit: items.length,
+            next: null,
+        },
+    };
+}
+
+export async function getAlbum(uri: string) {
+    const albumId = uri.replace("spotify:album:", "");
+
+    // This is Spotify's desktop-client album endpoint. It is less brittle than
+    // depending only on the public Web API response shape and returns every
+    // disc's tracks together.
+    try {
+        const clientAlbum = await Spicetify.CosmosAsync.get(`hm://album/v1/album-app/album/${albumId}/desktop`);
+        const normalizedClientAlbum = withAlbumTracks(clientAlbum);
+        if (normalizedClientAlbum.tracks.items.length > 0) return normalizedClientAlbum;
+    } catch (error) {
+        console.warn("Could not load album from Spotify's in-client endpoint:", error);
+    }
+
+    // Retain the public Web API as a fallback for client versions where the
+    // in-client endpoint is unavailable.
+    const albumUrl = `https://api.spotify.com/v1/albums/${albumId}`;
+    const tracksUrl = `${albumUrl}/tracks`;
+    const limit = 50;
+    const album = await Spicetify.CosmosAsync.get(albumUrl);
+    const normalizedAlbum = withAlbumTracks(album);
+    const items = [...normalizedAlbum.tracks.items];
+    const total = normalizedAlbum.tracks.total;
+    let offset = items.length;
+
+    // Fetch remaining pages for very long albums.
+    while (offset < total) {
+        const page = await Spicetify.CosmosAsync.get(`${tracksUrl}?offset=${offset}&limit=${limit}`);
+        const pageItems = getAlbumTrackItems(page);
+        if (pageItems.length === 0) break;
+
+        items.push(...pageItems);
+        offset += pageItems.length;
+    }
+
+    normalizedAlbum.tracks = { ...normalizedAlbum.tracks, items, total, offset: 0, limit: items.length, next: null };
+    return normalizedAlbum;
 }
 
 export async function getContents() {

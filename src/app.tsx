@@ -12,9 +12,10 @@ import {
     getRatingsByTrack,
     mergeAddedTrack,
     getPlaylistNames,
-    getAlbumRating,
+    getAlbumRatingDetails,
     sortPlaylistByRating,
     parseRatingPlaylistName,
+    getCanonicalRating,
 } from "./ratings";
 import { PlaylistUris, Ratings, TimestampedRating } from "./types/store";
 import { tracklistColumnCss } from "./css/css";
@@ -46,12 +47,13 @@ let oldTracklists = [];
 let oldNowPlayingWidget = null;
 let nowPlayingWidget = null;
 
-let oldPlayButton = null;
-let playButton = null;
-
-let albumId = null;
+let albumId: string | null = null;
 let album = null;
 let albumStarData = null;
+let albumRatingSummary: HTMLSpanElement | null = null;
+let albumLoadingId: string | null = null;
+let albumRequestId = 0;
+let loadedAlbumId: string | null = null;
 let nowPlayingWidgetStarData = null;
 
 let clickListenerRunning = false;
@@ -59,28 +61,7 @@ let ratingsLoading = false;
 let isSorting = false;
 
 export function getTrackRating(trackUri: string): number | null {
-    const rating = ratings[trackUri];
-
-    if (rating && rating.length > 0) {
-        // Time-weighted average with half-life of 6 months
-        const HALF_LIFE_MS = 6 * (365.25 / 12) * 24 * 60 * 60 * 1000;
-
-        let weightedSum = 0;
-        let weightSum = 0;
-
-        for (const { rating: value, time } of rating) {
-            const deltaMs = new Date().getTime() - time.getTime();
-
-            const weight = Math.pow(0.5, deltaMs / HALF_LIFE_MS);
-
-            weightedSum += value * weight;
-            weightSum += weight;
-        }
-
-        return weightedSum / weightSum;
-    } else {
-        return null;
-    }
+    return getCanonicalRating(ratings, trackUri);
 }
 
 export function getTrackRatingOrDefault(trackUri: string): number {
@@ -342,10 +323,122 @@ function selectWeightedTracks(tracks: Array<{ uri: string; weight: number }>, co
     return selected;
 }
 
-function updateAlbumRating() {
-    const averageRating = getAlbumRating(ratings, album);
+function findAlbumHeader(): Element | null {
+    // Spotify 1.2.98 renders the album heading in this stable semantic
+    // container. It contains the "Album" pretitle, title, and metadata.
+    const albumPage = document.querySelector("[data-testid='album-page']");
+    return (
+        albumPage?.querySelector(".main-entityHeader-headerText") ??
+        document.querySelector("main .main-entityHeader-headerText")
+    );
+}
 
-    setRating(albumStarData[1], averageRating, albumStarData[2]);
+function ensureAlbumStars(): boolean {
+    if (!isAlbumPage()) {
+        if (albumStarData) albumStarData[0].style.display = "none";
+        return false;
+    }
+
+    const header = findAlbumHeader();
+    if (!header) return false;
+
+    if (!albumStarData || !albumStarData[0].isConnected) {
+        albumStarData?.[0].remove();
+        albumStarData = createStars("album-header", 22);
+        albumStarData[0].classList.add("starRatingsAlbumHeader");
+        albumStarData[0].dataset.starRatingsAlbumRating = "true";
+        albumStarData[0].setAttribute("role", "img");
+        albumStarData[0].setAttribute("aria-label", "Album rating");
+        albumStarData[0].style.gap = "2px";
+        albumStarData[0].style.marginTop = "8px";
+        albumStarData[0].style.marginBottom = "4px";
+        albumStarData[0].style.minHeight = "22px";
+        albumStarData[0].style.width = "fit-content";
+        albumStarData[0].style.alignItems = "center";
+
+        // Album ratings are important context, so show a numeric average in
+        // addition to the star fill even when track-row exact ratings are off.
+        albumRatingSummary = document.createElement("span");
+        albumRatingSummary.className = "starRatingsAlbumSummary";
+        albumRatingSummary.style.marginLeft = "8px";
+        albumRatingSummary.style.fontSize = "0.875rem";
+        albumRatingSummary.style.fontWeight = "700";
+        albumRatingSummary.style.opacity = "0.9";
+        albumRatingSummary.style.whiteSpace = "nowrap";
+        albumStarData[0].appendChild(albumRatingSummary);
+    }
+
+    // Put the rating between the title and album metadata. This avoids the
+    // unstable action-bar classes that Spotify recently removed.
+    const metadata = header.querySelector(".main-entityHeader-metaData");
+    if (metadata) {
+        if (albumStarData[0].parentElement !== header || albumStarData[0].nextElementSibling !== metadata) {
+            metadata.insertAdjacentElement("beforebegin", albumStarData[0]);
+        }
+    } else if (albumStarData[0].parentElement !== header) {
+        header.appendChild(albumStarData[0]);
+    }
+
+    return true;
+}
+
+function getRenderedAlbumRatingDetails() {
+    const albumPage = document.querySelector("[data-testid='album-page']");
+    const trackUris = new Set<string>();
+    const trackRows = albumPage?.querySelectorAll(".main-trackList-trackListRow") ?? [];
+
+    for (const trackRow of Array.from(trackRows)) {
+        const trackUri = getTracklistTrackUri(trackRow);
+        if (typeof trackUri === "string" && trackUri.includes("track")) {
+            trackUris.add(trackUri);
+        }
+    }
+
+    let sumRatings = 0;
+    let ratedTracks = 0;
+    for (const trackUri of trackUris) {
+        if (!ratings[trackUri]?.length) continue;
+        const rating = getCanonicalRating(ratings, trackUri);
+        if (rating === null || !Number.isFinite(rating)) continue;
+
+        sumRatings += rating;
+        ratedTracks += 1;
+    }
+
+    return {
+        average: ratedTracks > 0 ? Math.round((sumRatings / ratedTracks) * 4) / 4 : null,
+        ratedTracks,
+        totalTracks: trackUris.size,
+    };
+}
+
+function updateAlbumRating() {
+    if (!albumStarData) return;
+
+    const albumDetails = album ? getAlbumRatingDetails(ratings, album) : null;
+    // The DOM fallback lets the header render even if Spotify changes the API
+    // response or the request has not completed yet. These are the same track
+    // URIs used by the visible rating column.
+    const { average, ratedTracks, totalTracks } = albumDetails?.ratedTracks ? albumDetails : getRenderedAlbumRatingDetails();
+    const stars = albumStarData[0];
+    const hasRating = average !== null;
+
+    stars.style.display = hasRating && albumId ? "flex" : "none";
+    if (!hasRating) {
+        if (albumRatingSummary) albumRatingSummary.textContent = "";
+        stars.removeAttribute("title");
+        stars.setAttribute("aria-label", "Album has no rated tracks");
+        return;
+    }
+
+    setRating(albumStarData[1], average, albumStarData[2]);
+    const exactAverage = average.toFixed(2);
+    const countLabel = totalTracks > 0 ? `${ratedTracks}/${totalTracks} rated` : `${ratedTracks} rated`;
+    if (albumRatingSummary) {
+        albumRatingSummary.textContent = albumStarData[2] ? `· ${countLabel}` : `${exactAverage}/5 · ${countLabel}`;
+    }
+    stars.title = `Album rating: ${exactAverage}/5 (${ratedTracks} of ${totalTracks} tracks rated)`;
+    stars.setAttribute("aria-label", stars.title);
 }
 
 async function handleRemoveRating(trackUri: string, rating: number, uid?: string) {
@@ -515,6 +608,9 @@ function getClickListener(i, ratingOverride, starData, getTrackUri) {
             }
 
             updateNowPlayingWidget();
+            // The album average is derived from the in-memory ratings map, so
+            // refresh it immediately after a track rating changes.
+            void updateAlbumStars();
 
             clickListenerRunning = false;
         });
@@ -681,7 +777,7 @@ function createStarsForTracklists(tracklists: HTMLCollectionOf<Element>) {
             };
             const hasStars = track.getElementsByClassName("stars").length > 0;
             const trackUri = getTracklistTrackUri(track);
-            const isTrack = trackUri.includes("track");
+            const isTrack = typeof trackUri === "string" && trackUri.includes("track");
 
             let ratingColumn = track.querySelector(".starRatings");
             // Add column for stars if not already present
@@ -745,13 +841,22 @@ function onClickShowPlaylistStars() {
 }
 
 async function observerCallback(keys) {
+    // Start album rendering first. Track lists may briefly contain virtual
+    // placeholder rows during Spotify navigation, and should never prevent
+    // the independent album header from being drawn.
+    void updateAlbumStars();
+
     oldMainElement = mainElement;
     mainElement = document.querySelector("main");
     if (mainElement && !mainElement.isEqualNode(oldMainElement)) {
         if (oldMainElement) {
             mainElementObserver.disconnect();
         }
-        updateTracklist();
+        try {
+            updateTracklist();
+        } catch (error) {
+            console.error("Error updating track ratings:", error);
+        }
         mainElementObserver.observe(mainElement, {
             childList: true,
             subtree: true,
@@ -775,15 +880,10 @@ async function observerCallback(keys) {
         }
     }
 
-    oldPlayButton = playButton;
-
-    // get album play button in order to add stars to the right of it
-    playButton = document.querySelector(".main-actionBar-ActionBar .ix_8kg3iUb9VS5SmTnBY");
-    if (playButton && !playButton.isEqualNode(oldPlayButton) && isAlbumPage() !== null) {
-        albumStarData = createStars("album", 32);
-        playButton.after(albumStarData[0]);
-        await updateAlbumStars();
-    }
+    // Album headers are rendered asynchronously and can be replaced during a
+    // route change. This call is intentionally non-blocking; the body
+    // observer will retry until the semantic header is available.
+    void updateAlbumStars();
 
     // Add weighted shuffle button to player controls
     const shuffleButton =
@@ -838,16 +938,58 @@ async function observerCallback(keys) {
 }
 
 async function updateAlbumStars() {
-    if (!albumStarData) return;
+    const nextAlbumId = isAlbumPage();
+    const routeChanged = albumId !== nextAlbumId;
+    albumId = nextAlbumId;
 
-    albumId = isAlbumPage();
-    albumStarData[0].style.display = albumId ? "flex" : "none";
-    console.log("albumId is:", albumId);
+    if (!albumId) {
+        album = null;
+        loadedAlbumId = null;
+        albumLoadingId = null;
+        albumRequestId += 1;
+        if (albumStarData) albumStarData[0].style.display = "none";
+        return;
+    }
 
-    if (!albumId) return;
+    if (routeChanged) {
+        album = null;
+        loadedAlbumId = null;
+        if (albumStarData) albumStarData[0].style.display = "none";
+    }
 
-    album = await api.getAlbum(albumId);
-    updateAlbumRating();
+    // Render from the visible album rows immediately. The in-client request
+    // below will replace this with the complete album data when it arrives.
+    if (ensureAlbumStars()) updateAlbumRating();
+
+    if (loadedAlbumId === albumId && album) {
+        updateAlbumRating();
+        return;
+    }
+
+    // History and mutation events can arrive several times while Spotify is
+    // painting a page. Avoid duplicate album requests for the same route.
+    if (albumLoadingId === albumId) return;
+
+    const requestedAlbumId = albumId;
+    const requestId = ++albumRequestId;
+    albumLoadingId = requestedAlbumId;
+
+    try {
+        const nextAlbum = await api.getAlbum(requestedAlbumId);
+        if (requestId !== albumRequestId || isAlbumPage() !== requestedAlbumId) return;
+
+        album = nextAlbum;
+        loadedAlbumId = requestedAlbumId;
+        ensureAlbumStars();
+        updateAlbumRating();
+    } catch (error) {
+        console.error("Error loading album rating:", error);
+        // Keep the DOM-derived value visible if a client endpoint changes or
+        // temporarily fails instead of silently removing the album rating.
+        if (ensureAlbumStars()) updateAlbumRating();
+    } finally {
+        if (albumLoadingId === requestedAlbumId) albumLoadingId = null;
+    }
 }
 
 function updateNowPlayingWidget() {
@@ -997,8 +1139,8 @@ async function main() {
         updateNowPlayingWidget();
     });
 
-    Spicetify.Platform.History.listen(async () => {
-        await updateAlbumStars();
+    Spicetify.Platform.History.listen(() => {
+        void updateAlbumStars();
     });
 
     new Spicetify.ContextMenu.Item(

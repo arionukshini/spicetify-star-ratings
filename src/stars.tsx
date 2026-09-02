@@ -113,10 +113,11 @@ export function createStars(trackURI: string, size: number): [HTMLSpanElement, (
     return [stars, starElements, label];
 }
 
-export function setRating(starElements: (SVGSVGElement | SVGPathElement)[][], rating: number, label?: HTMLElement) {
-    if (settings?.showExactRating && label && rating) label.textContent = rating.toFixed(2);
+export function setRating(starElements: (SVGSVGElement | SVGPathElement)[][], rating: number | null, label?: HTMLElement) {
+    const normalizedRating = typeof rating === "number" && Number.isFinite(rating) ? rating : 0;
+    if (settings?.showExactRating && label) label.textContent = rating !== null && Number.isFinite(rating) ? rating.toFixed(2) : "";
 
-    const totalQUnits = Math.round(rating * 4);
+    const totalQUnits = Math.round(normalizedRating * 4);
 
     const on = "var(--spice-button)";
     const off = "var(--spice-button-disabled)";
@@ -144,7 +145,7 @@ export function setRating(starElements: (SVGSVGElement | SVGPathElement)[][], ra
             (brPath as SVGPathElement).setAttributeNS(null, "fill", halfFilled >= 2 ? on : off);
         } else {
             // Whole stars
-            const isLit = i < Math.round(rating);
+            const isLit = i < Math.round(normalizedRating);
             (tlPath as SVGPathElement).setAttributeNS(null, "fill", isLit ? on : off);
             (blPath as SVGPathElement).setAttributeNS(null, "fill", isLit ? on : off);
             (trPath as SVGPathElement).setAttributeNS(null, "fill", isLit ? on : off);

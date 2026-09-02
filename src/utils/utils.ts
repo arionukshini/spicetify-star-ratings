@@ -17,9 +17,8 @@ export function getTracklistTrackUri(tracklistElement: Element) {
 
 export function isAlbumPage() {
     const pathname = Spicetify.Platform.History.location.pathname;
-    const matches = pathname.match(/album\/(.*)/);
-    if (!matches) return null;
-    return matches[1];
+    const matches = pathname.match(/^\/album\/([^/]+)/);
+    return matches?.[1] ?? null;
 }
 
 export function trackUriToTrackId(trackUri: string): string {

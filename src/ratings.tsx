@@ -1,5 +1,5 @@
 import * as api from "./api";
-import { getTrackRating, getTrackRatingOrDefault } from "./app";
+import { getTrackRatingOrDefault } from "./app";
 import { PlaylistUris, Ratings, TimestampedRating, Track } from "./types/store";
 interface Contents {
     uri?: string;
@@ -189,30 +189,75 @@ export function mergeAddedTrack(
     return entry;
 }
 
-export function getAlbumRating(ratings: Ratings, album): number {
-    console.log("album is:", album);
-    if (!album) return 0.0;
+export function getCanonicalRating(ratings: Ratings, trackUri: string): number | null {
+    const trackRatings = ratings[trackUri];
+    if (!trackRatings || trackRatings.length === 0) return null;
 
-    const items = album.tracks.items; // Accessing items directly from album object
-    let sumRatings = 0.0;
-    let numRatings = 0;
+    // Time-weighted average with half-life of 6 months. Keep this calculation
+    // here so album averages use the same canonical track rating as the stars
+    // shown elsewhere in the extension.
+    const HALF_LIFE_MS = 6 * (365.25 / 12) * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    let weightedSum = 0;
+    let weightSum = 0;
 
-    for (const item of items) {
-        const trackUri = item.uri; // Correctly reference the track URI
-        const rating = getTrackRating(trackUri);
-
-        if (!rating) continue;
-
-        sumRatings += rating;
-        numRatings += 1;
+    for (const { rating, time } of trackRatings) {
+        const weight = Math.pow(0.5, (now - time.getTime()) / HALF_LIFE_MS);
+        weightedSum += rating * weight;
+        weightSum += weight;
     }
 
-    let averageRating = 0.0;
-    if (numRatings > 0) averageRating = sumRatings / numRatings;
+    return weightSum > 0 ? weightedSum / weightSum : null;
+}
 
-    // Round to nearest 0.25 (finest supported granularity)
-    averageRating = Math.round(averageRating * 4) / 4;
-    return averageRating;
+export interface AlbumRatingDetails {
+    average: number | null;
+    ratedTracks: number;
+    totalTracks: number;
+}
+
+type AlbumTrackForRating = {
+    uri?: string;
+    linked_from?: { uri?: string };
+};
+
+type AlbumForRating = {
+    tracks?: { items?: AlbumTrackForRating[] };
+};
+
+export function getAlbumRatingDetails(ratings: Ratings, album?: AlbumForRating | null): AlbumRatingDetails {
+    const items = Array.isArray(album?.tracks?.items) ? album.tracks.items : [];
+    let sumRatings = 0;
+    let ratedTracks = 0;
+
+    for (const item of items) {
+        // linked_from is present for some unavailable/relinked album tracks.
+        // Prefer the visible track URI, but accept the original URI when that
+        // is the one stored in the user's rating playlists.
+        const trackUris = [item?.uri, item?.linked_from?.uri].filter(
+            (uri, index, all): uri is string => typeof uri === "string" && all.indexOf(uri) === index,
+        );
+        const trackUri = trackUris.find((uri) => ratings[uri]?.length > 0);
+        if (!trackUri) continue;
+
+        const rating = getCanonicalRating(ratings, trackUri);
+        if (rating === null || !Number.isFinite(rating)) continue;
+
+        sumRatings += rating;
+        ratedTracks += 1;
+    }
+
+    if (ratedTracks === 0) {
+        return { average: null, ratedTracks: 0, totalTracks: items.length };
+    }
+
+    // Quarter-star precision is the finest precision supported by the star UI.
+    const average = Math.round((sumRatings / ratedTracks) * 4) / 4;
+    return { average, ratedTracks, totalTracks: items.length };
+}
+
+export function getAlbumRating(ratings: Ratings, album?: AlbumForRating | null): number | null {
+    return getAlbumRatingDetails(ratings, album).average;
 }
 
 export async function sortPlaylistByRating(playlistUri: string, ratings: Ratings) {
