@@ -50,6 +50,10 @@ It is the average of the canonical ratings for the album's rated songs only;
 unrated songs do not count. Albums with no rated songs do not show an album
 rating.
 
+The calculated value is cached locally in Spicetify storage and is refreshed
+when the album's rated rows render or a rating changes. This keeps the rating
+available on later visits without making album-page network requests.
+
 ## Star Rating Playlist Images
 
 <table>

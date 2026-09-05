@@ -90,19 +90,9 @@ function withAlbumTracks(album: any): any {
 export async function getAlbum(uri: string) {
     const albumId = uri.replace("spotify:album:", "");
 
-    // This is Spotify's desktop-client album endpoint. It is less brittle than
-    // depending only on the public Web API response shape and returns every
-    // disc's tracks together.
-    try {
-        const clientAlbum = await Spicetify.CosmosAsync.get(`hm://album/v1/album-app/album/${albumId}/desktop`);
-        const normalizedClientAlbum = withAlbumTracks(clientAlbum);
-        if (normalizedClientAlbum.tracks.items.length > 0) return normalizedClientAlbum;
-    } catch (error) {
-        console.warn("Could not load album from Spotify's in-client endpoint:", error);
-    }
-
-    // Retain the public Web API as a fallback for client versions where the
-    // in-client endpoint is unavailable.
+    // Keep this helper on the public Web API. Album page ratings deliberately
+    // do not call it: current Spotify clients can reject internal album
+    // requests while the route is mounting.
     const albumUrl = `https://api.spotify.com/v1/albums/${albumId}`;
     const tracksUrl = `${albumUrl}/tracks`;
     const limit = 50;

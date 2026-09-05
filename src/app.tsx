@@ -1,4 +1,5 @@
 import * as api from "./api";
+import { getCachedAlbumRating, saveCachedAlbumRating } from "./album-rating-cache";
 import { createStars, setRating, getMouseoverRating, findStars, toRatingString } from "./stars";
 import { Settings, getSettings, saveSettings, getPlaylistUris, savePlaylistUris, getRatedFolderUri, saveRatedFolderUri } from "./settings";
 import { Settings as SettingsUi } from "./settings-ui";
@@ -12,7 +13,6 @@ import {
     getRatingsByTrack,
     mergeAddedTrack,
     getPlaylistNames,
-    getAlbumRatingDetails,
     sortPlaylistByRating,
     parseRatingPlaylistName,
     getCanonicalRating,
@@ -48,12 +48,9 @@ let oldNowPlayingWidget = null;
 let nowPlayingWidget = null;
 
 let albumId: string | null = null;
-let album = null;
 let albumStarData = null;
 let albumRatingSummary: HTMLSpanElement | null = null;
-let albumLoadingId: string | null = null;
-let albumRequestId = 0;
-let loadedAlbumId: string | null = null;
+let albumRefreshGeneration = 0;
 let nowPlayingWidgetStarData = null;
 
 let clickListenerRunning = false;
@@ -415,11 +412,13 @@ function getRenderedAlbumRatingDetails() {
 function updateAlbumRating() {
     if (!albumStarData) return;
 
-    const albumDetails = album ? getAlbumRatingDetails(ratings, album) : null;
-    // The DOM fallback lets the header render even if Spotify changes the API
-    // response or the request has not completed yet. These are the same track
-    // URIs used by the visible rating column.
-    const { average, ratedTracks, totalTracks } = albumDetails?.ratedTracks ? albumDetails : getRenderedAlbumRatingDetails();
+    const renderedDetails = getRenderedAlbumRatingDetails();
+    // Use the exact track rows Spotify has already rendered. This is the same
+    // source as the visible Ratings column and avoids making an album request
+    // while Spotify itself is still loading the album page.
+    const calculatedDetails = renderedDetails;
+    const cachedDetails = getCachedAlbumRating(albumId);
+    const { average, ratedTracks, totalTracks } = calculatedDetails.ratedTracks > 0 ? calculatedDetails : cachedDetails ?? calculatedDetails;
     const stars = albumStarData[0];
     const hasRating = average !== null;
 
@@ -439,6 +438,13 @@ function updateAlbumRating() {
     }
     stars.title = `Album rating: ${exactAverage}/5 (${ratedTracks} of ${totalTracks} tracks rated)`;
     stars.setAttribute("aria-label", stars.title);
+
+    // Keep a small local cache so a previously calculated album average is
+    // available immediately on the next visit. A fresh calculation always
+    // replaces it once Spotify's album data or visible rows are ready.
+    if (calculatedDetails.ratedTracks > 0) {
+        saveCachedAlbumRating(albumId, calculatedDetails as { average: number; ratedTracks: number; totalTracks: number });
+    }
 }
 
 async function handleRemoveRating(trackUri: string, rating: number, uid?: string) {
@@ -610,7 +616,7 @@ function getClickListener(i, ratingOverride, starData, getTrackUri) {
             updateNowPlayingWidget();
             // The album average is derived from the in-memory ratings map, so
             // refresh it immediately after a track rating changes.
-            void updateAlbumStars();
+            scheduleAlbumStars();
 
             clickListenerRunning = false;
         });
@@ -841,11 +847,6 @@ function onClickShowPlaylistStars() {
 }
 
 async function observerCallback(keys) {
-    // Start album rendering first. Track lists may briefly contain virtual
-    // placeholder rows during Spotify navigation, and should never prevent
-    // the independent album header from being drawn.
-    void updateAlbumStars();
-
     oldMainElement = mainElement;
     mainElement = document.querySelector("main");
     if (mainElement && !mainElement.isEqualNode(oldMainElement)) {
@@ -879,11 +880,6 @@ async function observerCallback(keys) {
             getRegisterKeyboardShortcuts(keys)();
         }
     }
-
-    // Album headers are rendered asynchronously and can be replaced during a
-    // route change. This call is intentionally non-blocking; the body
-    // observer will retry until the semantic header is available.
-    void updateAlbumStars();
 
     // Add weighted shuffle button to player controls
     const shuffleButton =
@@ -937,58 +933,34 @@ async function observerCallback(keys) {
     }
 }
 
-async function updateAlbumStars() {
+function updateAlbumStars() {
     const nextAlbumId = isAlbumPage();
     const routeChanged = albumId !== nextAlbumId;
     albumId = nextAlbumId;
 
     if (!albumId) {
-        album = null;
-        loadedAlbumId = null;
-        albumLoadingId = null;
-        albumRequestId += 1;
         if (albumStarData) albumStarData[0].style.display = "none";
         return;
     }
 
     if (routeChanged) {
-        album = null;
-        loadedAlbumId = null;
         if (albumStarData) albumStarData[0].style.display = "none";
     }
 
-    // Render from the visible album rows immediately. The in-client request
-    // below will replace this with the complete album data when it arrives.
+    // The header is filled from the persistent cache right away and then from
+    // the visible album rows as Spotify finishes rendering them.
     if (ensureAlbumStars()) updateAlbumRating();
+}
 
-    if (loadedAlbumId === albumId && album) {
-        updateAlbumRating();
-        return;
-    }
-
-    // History and mutation events can arrive several times while Spotify is
-    // painting a page. Avoid duplicate album requests for the same route.
-    if (albumLoadingId === albumId) return;
-
-    const requestedAlbumId = albumId;
-    const requestId = ++albumRequestId;
-    albumLoadingId = requestedAlbumId;
-
-    try {
-        const nextAlbum = await api.getAlbum(requestedAlbumId);
-        if (requestId !== albumRequestId || isAlbumPage() !== requestedAlbumId) return;
-
-        album = nextAlbum;
-        loadedAlbumId = requestedAlbumId;
-        ensureAlbumStars();
-        updateAlbumRating();
-    } catch (error) {
-        console.error("Error loading album rating:", error);
-        // Keep the DOM-derived value visible if a client endpoint changes or
-        // temporarily fails instead of silently removing the album rating.
-        if (ensureAlbumStars()) updateAlbumRating();
-    } finally {
-        if (albumLoadingId === requestedAlbumId) albumLoadingId = null;
+function scheduleAlbumStars() {
+    const generation = ++albumRefreshGeneration;
+    // Spotify's History event fires before the new album header exists. A few
+    // bounded retries are enough to catch its asynchronous render without
+    // subscribing to our own SVG attribute mutations.
+    for (const delay of [0, 120, 400, 1000, 2000, 3500]) {
+        window.setTimeout(() => {
+            if (generation === albumRefreshGeneration) void updateAlbumStars();
+        }, delay);
     }
 }
 
@@ -1140,7 +1112,7 @@ async function main() {
     });
 
     Spicetify.Platform.History.listen(() => {
-        void updateAlbumStars();
+        scheduleAlbumStars();
     });
 
     new Spicetify.ContextMenu.Item(
@@ -1267,10 +1239,11 @@ async function main() {
         shouldAddContextMenuOnPlaylists,
     ).register();
 
-    const observer = new MutationObserver(async () => {
-        await observerCallback(keys);
+    const observer = new MutationObserver(() => {
+        void observerCallback(keys);
     });
     await observerCallback(keys);
+    scheduleAlbumStars();
     observer.observe(document.body, {
         childList: true,
         subtree: true,
