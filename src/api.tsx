@@ -140,8 +140,9 @@ export async function addTrackToPlaylist(playlistUri: string, trackUri: string) 
     await getPlaylistAPI().add(playlistUri, [trackUri], { after: 1, before: 0 });
 }
 
-export async function removeTrackFromPlaylist(playlistUri: string, trackUri: string, uid?: string) {
-    await getPlaylistAPI().remove(playlistUri, [{ uri: trackUri, uid: uid ?? "" }]);
+export async function removeTrackFromPlaylist(playlistUri: string, trackUri: string, playlistItemId: string) {
+    if (!playlistItemId) throw new Error("Cannot remove a rating without a playlist-item ID");
+    await getPlaylistAPI().remove(playlistUri, [{ uri: trackUri, uid: playlistItemId }]);
 }
 
 export async function getPlaylistItems(uri: string) {
@@ -176,7 +177,8 @@ export async function moveTracksAfter(playlistUri: string, trackUids: string[], 
 export async function getTracksWithSameISRC(uri: string) {
     // Get ISRC code for the track
     const track = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/tracks/${uri}`);
-    const isrc = track.external_ids.isrc;
+    const isrc = track?.external_ids?.isrc;
+    if (typeof isrc !== "string" || !isrc) return [];
 
     // Search for tracks with the same ISRC code
     const query = {
@@ -186,7 +188,7 @@ export async function getTracksWithSameISRC(uri: string) {
     };
 
     const response = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/search`, query);
-    return response.tracks.items;
+    return Array.isArray(response?.tracks?.items) ? response.tracks.items : [];
 }
 
 export async function getLikedSongsTracks(): Promise<Array<{ uri: string; link: string }>> {

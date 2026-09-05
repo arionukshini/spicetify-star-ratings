@@ -6,8 +6,14 @@ export interface Ratings {
     [key: string]: TimestampedRating[];
 }
 export type Track = {
+    // Spotify's playlist implementation has used both names across client
+    // versions. These identify an item occurrence inside a playlist, not the
+    // underlying track itself.
+    uid?: string;
+    rowId?: string;
+    uri?: string;
     hasLyrics: boolean;
-    link: string;
+    link?: string;
     name: string;
     length: number;
     playable: boolean;
@@ -50,7 +56,6 @@ export type Track = {
         link: string;
         name: string;
     }>;
-    rowId: string;
     addTime: number;
     addedBy: {
         username: string;
@@ -66,5 +71,4 @@ export type Track = {
         large: string;
         xlarge: string;
     };
-    uid: string;
 };

@@ -192,6 +192,7 @@ export function Settings({
     updateTracklist,
     restoreTracklist,
     redrawNowPlayingStars,
+    refreshWeightedShuffleButton,
 }) {
     function handleEnableKeyboardShortcutsCheckboxClick() {
         if (settings.enableKeyboardShortcuts) registerKeyboardShortcuts();
@@ -229,10 +230,7 @@ export function Settings({
                     </>
                 }
                 field="showWeightedShuffle"
-                onclick={() => {
-                    const btn = document.querySelector(".weighted-shuffle-button");
-                    if (btn) btn.remove();
-                }}
+                onclick={refreshWeightedShuffleButton}
             />
             <DropdownItem
                 settings={settings}
@@ -288,9 +286,9 @@ export function Settings({
                 settings={settings}
                 name={
                     <>
-                        Sync duplicate songs with same rating
+                        Rate identical releases together
                         <br />
-                        (Does not apply to songs that have already been rated)
+                        (Matches Spotify's ISRC; preserves songs you already rated)
                     </>
                 }
                 field="syncDuplicateSongs"

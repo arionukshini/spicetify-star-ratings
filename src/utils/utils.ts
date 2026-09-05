@@ -35,36 +35,53 @@ export function getPlayerContext(): Spicetify.PlayerContext | null {
 }
 
 const WEIGHTED_PLAYBACK_ENABLED_LOCAL_STORAGE_KEY = "starRatings:weighted-playback-enabled";
+let weightedPlaybackEnabledRecord: Record<string, boolean> | null = null;
+
 function getWeightedPlaybackEnabledRecord(): Record<string, boolean> {
+    if (weightedPlaybackEnabledRecord) return weightedPlaybackEnabledRecord;
+
     const localstorage = getLocalStorageData(WEIGHTED_PLAYBACK_ENABLED_LOCAL_STORAGE_KEY);
 
-    if (localstorage) {
+    try {
+        if (!localstorage) {
+            weightedPlaybackEnabledRecord = {};
+            return weightedPlaybackEnabledRecord;
+        }
+
         const parsed = JSON.parse(localstorage);
         if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-            return {};
-        } else {
-            return parsed;
+            weightedPlaybackEnabledRecord = {};
+            return weightedPlaybackEnabledRecord;
         }
-    } else {
-        return {};
+
+        weightedPlaybackEnabledRecord = parsed as Record<string, boolean>;
+        return weightedPlaybackEnabledRecord;
+    } catch (error) {
+        console.warn("Could not read weighted playback settings:", error);
+        weightedPlaybackEnabledRecord = {};
+        return weightedPlaybackEnabledRecord;
     }
 }
+
 export function weightedPlaybackEnabledForPlaylist(): boolean {
     const context = getPlayerContext();
-    if (!context) {
+    const contextUri = context?.uri;
+    if (typeof contextUri !== "string" || !contextUri) {
         return false;
     }
 
     const record = getWeightedPlaybackEnabledRecord();
-    return record[context.uri] ?? false;
+    return record[contextUri] ?? false;
 }
+
 export function setWeightedPlaybackEnabledForPlaylist(enabled: boolean) {
     const context = getPlayerContext();
-    if (!context) {
+    const contextUri = context?.uri;
+    if (typeof contextUri !== "string" || !contextUri) {
         return;
     }
 
-    let record = getWeightedPlaybackEnabledRecord();
-    record[context.uri] = enabled;
+    const record = getWeightedPlaybackEnabledRecord();
+    record[contextUri] = enabled;
     setLocalStorageData(WEIGHTED_PLAYBACK_ENABLED_LOCAL_STORAGE_KEY, JSON.stringify(record));
 }

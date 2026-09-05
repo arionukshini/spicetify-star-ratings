@@ -78,6 +78,16 @@ export function getPlaylistNames(playlistUris: PlaylistUris, ratedFolder: Conten
 
 type PlaylistItemsEntry = { rating: number; playlistUri: string; tracks: Track[] };
 
+/**
+ * Return Spotify's stable identifier for one occurrence of a track in a
+ * playlist. Spotify has switched between `uid` and `rowId` in its client
+ * responses, so every move/remove operation must use the same fallback.
+ */
+export function getPlaylistItemId(track: Pick<Track, "uid" | "rowId">): string | null {
+    const id = track.uid ?? track.rowId;
+    return typeof id === "string" && id.length > 0 ? id : null;
+}
+
 export async function getAllPlaylistItems(playlistUris: PlaylistUris): Promise<PlaylistItemsEntry[]> {
     const entries: { rating: number; playlistUri: string }[] = [];
     // Object.entries always yields string keys; parse back to number.
@@ -124,10 +134,16 @@ export function getRatingsByTrack(allPlaylistItems: PlaylistItemsEntry[]): Ratin
     for (const { rating, playlistUri, tracks } of allPlaylistItems) {
         for (const track of tracks) {
             const trackUri = track.link ?? track.uri;
+            const playlistItemId = getPlaylistItemId(track);
+            if (typeof trackUri !== "string" || !playlistItemId) {
+                console.warn("Skipping a rating playlist item without a track URI or playlist-item ID", track);
+                continue;
+            }
+
             const entry: TimestampedRating = {
                 rating,
                 time: new Date(track.addedAt),
-                uid: track.uid,
+                uid: playlistItemId,
                 playlistUri,
             };
 
@@ -167,17 +183,20 @@ export function mergeAddedTrack(
     trackUri: string,
     tracks: Track[],
 ): TimestampedRating | undefined {
-    const candidates = tracks.filter((track) => track.uri === trackUri);
+    const candidates = tracks.filter((track) => (track.link ?? track.uri) === trackUri && getPlaylistItemId(track));
     if (candidates.length === 0) return undefined;
 
     // The just-added entry has the most recent add time.
     const added = candidates.reduce((prev, current) =>
         new Date(current.addedAt).getTime() > new Date(prev.addedAt).getTime() ? current : prev,
     );
+    const playlistItemId = getPlaylistItemId(added);
+    if (!playlistItemId) return undefined;
+
     const entry: TimestampedRating = {
         rating,
         time: new Date(added.addedAt),
-        uid: added.uid,
+        uid: playlistItemId,
         playlistUri,
     };
 
@@ -261,18 +280,23 @@ export function getAlbumRating(ratings: Ratings, album?: AlbumForRating | null):
 }
 
 export async function sortPlaylistByRating(playlistUri: string, ratings: Ratings) {
-    const items = await api.getPlaylistItems(playlistUri);
+    const items = (await api.getPlaylistItems(playlistUri)) as Track[];
 
     if (items.length < 2) return;
 
     const sorted = items
-        .map((item, idx) => ({
-            uid: item.uid ?? item.rowId,
-            rating: getTrackRatingOrDefault(item.link ?? item.uri),
-            idx,
-        }))
+        .map((item, idx) => {
+            const playlistItemId = getPlaylistItemId(item);
+            const trackUri = item.link ?? item.uri;
+            return playlistItemId && typeof trackUri === "string"
+                ? { uid: playlistItemId, rating: getTrackRatingOrDefault(trackUri), idx }
+                : null;
+        })
+        .filter((item): item is { uid: string; rating: number; idx: number } => item !== null)
         .sort((a, b) => b.rating - a.rating || a.idx - b.idx)
         .map((item) => item.uid);
+
+    if (sorted.length < 2) return;
 
     // Use lowest-rated track as anchor, then insert tracks in descending-rating order before it.
     const anchor = sorted[sorted.length - 1];

@@ -13,11 +13,12 @@ import {
     getRatingsByTrack,
     mergeAddedTrack,
     getPlaylistNames,
+    getPlaylistItemId,
     sortPlaylistByRating,
     parseRatingPlaylistName,
     getCanonicalRating,
 } from "./ratings";
-import { PlaylistUris, Ratings, TimestampedRating } from "./types/store";
+import { PlaylistUris, Ratings, TimestampedRating, Track } from "./types/store";
 import { tracklistColumnCss } from "./css/css";
 import {
     getTracklistTrackUri,
@@ -38,14 +39,12 @@ export let playlistUris: PlaylistUris = {};
 
 let originalTracklistHeaderCss = null;
 let originalTracklistTrackCss = null;
-let oldMainElement = null;
-let mainElement = null;
-let mainElementObserver = null;
+let mainElement: Element | null = null;
+let mainElementObserver: MutationObserver | null = null;
 let tracklists: HTMLCollectionOf<Element> = [];
 let oldTracklists = [];
 
-let oldNowPlayingWidget = null;
-let nowPlayingWidget = null;
+let nowPlayingWidget: Element | null = null;
 
 let albumId: string | null = null;
 let albumStarData = null;
@@ -53,9 +52,13 @@ let albumRatingSummary: HTMLSpanElement | null = null;
 let albumRefreshGeneration = 0;
 let nowPlayingWidgetStarData = null;
 
-let clickListenerRunning = false;
 let ratingsLoading = false;
 let isSorting = false;
+let ratingChangeQueue: Promise<void> = Promise.resolve();
+let tracklistUpdateScheduled = false;
+let observerCallbackScheduled = false;
+let weightedQueueUpdateInFlight = false;
+let weightedShuffleButton: HTMLButtonElement | null = null;
 
 export function getTrackRating(trackUri: string): number | null {
     return getCanonicalRating(ratings, trackUri);
@@ -174,8 +177,7 @@ function getQueuedTracks(): Array<{ uri: string }> {
 }
 
 async function addWeightedTrackToQueue(): Promise<boolean> {
-    const context = getPlayerContext();
-    if (!weightedPlaybackEnabledForPlaylist(context.uri)) return false;
+    if (!weightedPlaybackEnabledForPlaylist()) return false;
 
     try {
         const trackUri = await selectWeightedRandomTrack();
@@ -208,23 +210,21 @@ function shouldAddWeightedTrack(): boolean {
     return getQueuedTracks().length == 0;
 }
 
-async function weightedLoop() {
-    while (true) {
+function requestWeightedQueueUpdate() {
+    if (weightedQueueUpdateInFlight) return;
+
+    weightedQueueUpdateInFlight = true;
+    void (async () => {
         try {
             if (weightedPlaybackEnabledForPlaylist() && shouldAddWeightedTrack()) {
                 await addWeightedTrackToQueue();
             }
-        } catch (e) {
-            console.error("Weighted loop error:", e);
+        } catch (error) {
+            console.error("Error updating weighted queue:", error);
+        } finally {
+            weightedQueueUpdateInFlight = false;
         }
-        let timeout;
-        if (settings.reEnqueueWorkaround) {
-            timeout = 1500; // avoid interference with re-enqueueing
-        } else {
-            timeout = 500;
-        }
-        await new Promise((r) => setTimeout(r, timeout));
-    }
+    })();
 }
 
 // --- weighted playlist ---
@@ -449,29 +449,56 @@ function updateAlbumRating() {
     }
 }
 
-async function handleRemoveRating(trackUri: string, rating: number, uid?: string) {
+async function findFreshPlaylistItemId(playlistUri: string, trackUri: string, ratedAt?: Date): Promise<string | null> {
+    const playlistItems = (await api.getPlaylistItems(playlistUri)) as Track[];
+    const candidates: Array<{ id: string; addedAt: number }> = playlistItems
+        .filter((item) => (item.link ?? item.uri) === trackUri)
+        .map((item) => ({ id: getPlaylistItemId(item), addedAt: new Date(item.addedAt).getTime() }))
+        .filter((item): item is { id: string; addedAt: number } => item.id !== null);
+
+    if (candidates.length === 0) return null;
+    if (!ratedAt) return candidates[candidates.length - 1].id;
+
+    return candidates.reduce((closest, candidate) =>
+        Math.abs(candidate.addedAt - ratedAt.getTime()) < Math.abs(closest.addedAt - ratedAt.getTime()) ? candidate : closest,
+    ).id;
+}
+
+async function handleRemoveRating(trackUri: string, rating: number, uid?: string, showNotification = true) {
     const entry =
         uid != null ? ratings[trackUri]?.find((r) => r.rating === rating && r.uid === uid) : ratings[trackUri]?.find((r) => r.rating === rating);
     const targetPlaylistUri = entry?.playlistUri ?? (playlistUris[rating] ?? [])[0];
-    const playlistName = playlistNames[targetPlaylistUri] ?? toRatingString(rating);
-    await api.removeTrackFromPlaylist(targetPlaylistUri, trackUri, uid);
+    if (!targetPlaylistUri) throw new Error(`Could not find the ${toRatingString(rating)} rating playlist`);
+    const playlistItemId = entry?.uid ?? uid;
+    if (!playlistItemId) throw new Error("Could not find this rating's playlist-item ID. Reload ratings and try again.");
 
-    if (uid != null) {
-        const index = ratings[trackUri].findIndex((r) => r.rating === rating && r.uid === uid);
+    const playlistName = playlistNames[targetPlaylistUri] ?? toRatingString(rating);
+    try {
+        await api.removeTrackFromPlaylist(targetPlaylistUri, trackUri, playlistItemId);
+    } catch (error) {
+        // Playlist rows can be re-keyed after an external edit or a Spotify
+        // client update. Re-fetch once and retry with the current row ID.
+        const freshPlaylistItemId = await findFreshPlaylistItemId(targetPlaylistUri, trackUri, entry?.time);
+        if (!freshPlaylistItemId || freshPlaylistItemId === playlistItemId) throw error;
+        await api.removeTrackFromPlaylist(targetPlaylistUri, trackUri, freshPlaylistItemId);
+    }
+
+    if (entry) {
+        const index = ratings[trackUri].findIndex((r) => r.rating === entry.rating && r.uid === entry.uid);
         if (index !== -1) {
             ratings[trackUri].splice(index, 1);
         }
         if (ratings[trackUri].length === 0) {
             delete ratings[trackUri];
         }
-    } else {
+    } else if (uid == null) {
         delete ratings[trackUri];
     }
 
-    api.showNotification(`Removed from ${playlistName}`);
+    if (showNotification) api.showNotification(`Removed from ${playlistName}`);
 }
 
-async function handleAddRating(trackUri: string, newRating: number) {
+async function handleAddRating(trackUri: string, newRating: number, showNotification = true): Promise<boolean> {
     try {
         const contents = await api.getContents(); // get fresh contents
 
@@ -528,7 +555,7 @@ async function handleAddRating(trackUri: string, newRating: number) {
                 await api.moveToFront(targetPlaylistUri, addedEntry.uid);
             } else {
                 const lastItem = targetPlaylistItems[targetPlaylistItems.length - 1];
-                const lastItemUid = lastItem?.uid ?? lastItem?.rowId;
+                const lastItemUid = lastItem ? getPlaylistItemId(lastItem) : null;
                 if (lastItemUid && addedEntry.uid !== lastItemUid) {
                     await api.moveTracksAfter(targetPlaylistUri, [addedEntry.uid], lastItemUid);
                 }
@@ -537,90 +564,114 @@ async function handleAddRating(trackUri: string, newRating: number) {
             console.warn(`Could not find ${trackUri} in ${targetPlaylistUri} after adding it; ratings may be stale`);
         }
 
-        api.showNotification(`Added to ${playlistNames[targetPlaylistUri] ?? ratingName}`);
+        if (showNotification) api.showNotification(`Added to ${playlistNames[targetPlaylistUri] ?? ratingName}`);
+        return true;
     } catch (error) {
         console.error("Error in handleAddRating:", error);
         api.showNotification("Error updating rating: " + ((error as any).message || "Unknown error"));
+        return false;
     }
+}
+
+function enqueueRatingChange(operation: () => Promise<void>) {
+    // Playlist mutations change the local rating map as they finish. Keeping
+    // them in one queue prevents quick clicks and duplicate-track work from
+    // observing an older version of that map.
+    const queuedOperation = ratingChangeQueue.catch(() => undefined).then(operation);
+    ratingChangeQueue = queuedOperation.catch((error) => {
+        console.error("Queued rating update failed:", error);
+    });
+    return queuedOperation;
+}
+
+async function getRatingTargetTrackUris(trackUri: string): Promise<string[]> {
+    if (!settings.syncDuplicateSongs) return [trackUri];
+
+    try {
+        const tracksWithSameISRC = await api.getTracksWithSameISRC(trackUri.substring("spotify:track:".length));
+        const trackUris = new Set([trackUri]);
+
+        for (const track of tracksWithSameISRC) {
+            const duplicateUri = track?.uri;
+            // Keep an existing duplicate's individual rating intact. This is
+            // the behavior advertised by the setting and avoids overwriting
+            // ratings made before duplicate sync was enabled.
+            if (typeof duplicateUri === "string" && !ratings[duplicateUri]?.length) {
+                trackUris.add(duplicateUri);
+            }
+        }
+
+        return [...trackUris];
+    } catch (error) {
+        console.error("Could not find duplicate tracks to sync:", error);
+        api.showNotification("Rated this track, but could not sync duplicate tracks.");
+        return [trackUri];
+    }
+}
+
+async function applyRatingToTrack(trackUri: string, newRating: number, showNotification: boolean) {
+    const oldRatings = ratings[trackUri];
+    const fiveMinutes = 5 * 60 * 1000;
+    const oldRating = settings.averageRatings ? oldRatings?.find((entry) => Date.now() - entry.time.getTime() <= fiveMinutes) : oldRatings?.[0];
+
+    if (oldRating) {
+        await handleRemoveRating(trackUri, oldRating.rating, oldRating.uid, showNotification);
+    }
+
+    if (!oldRating || oldRating.rating !== newRating) {
+        const didAddRating = await handleAddRating(trackUri, newRating, showNotification);
+        if (didAddRating && settings.likeThreshold !== "disabled" && newRating >= parseFloat(settings.likeThreshold)) {
+            void api.addTrackToLikedSongs(trackUri).catch((error) => console.error("Could not add rated track to Liked Songs:", error));
+        }
+    }
+}
+
+function refreshTrackRatingUi(trackUri: string) {
+    const tracklistStarData = findStars(trackUriToTrackId(trackUri));
+    if (!tracklistStarData) return;
+
+    const currentRating = getTrackRating(trackUri);
+    setRating(tracklistStarData[1], currentRating, tracklistStarData[2]);
+    tracklistStarData[0].style.visibility = currentRating === null ? "hidden" : "visible";
+}
+
+async function applyRatingChange(trackUri: string, newRating: number) {
+    const targetTrackUris = await getRatingTargetTrackUris(trackUri);
+
+    for (const targetTrackUri of targetTrackUris) {
+        try {
+            await applyRatingToTrack(targetTrackUri, newRating, targetTrackUri === trackUri);
+        } catch (error) {
+            console.error(`Could not update rating for ${targetTrackUri}:`, error);
+            api.showNotification("Error updating rating: " + ((error as any).message || "Unknown error"));
+        }
+    }
+
+    for (const targetTrackUri of targetTrackUris) refreshTrackRatingUi(targetTrackUri);
+    updateNowPlayingWidget();
+    const syncedDuplicateCount = targetTrackUris.length - 1;
+    if (syncedDuplicateCount > 0) {
+        api.showNotification(`Also rated ${syncedDuplicateCount} matching release${syncedDuplicateCount === 1 ? "" : "s"}.`);
+    }
+    // The album average is derived from the in-memory ratings map, so refresh
+    // it only after the complete, serialised rating batch has finished.
+    scheduleAlbumStars();
 }
 
 function getClickListener(i, ratingOverride, starData, getTrackUri) {
     return () => {
-        if (clickListenerRunning || ratingsLoading || isSorting) return;
-        clickListenerRunning = true;
-        const [stars, starElements] = starData;
-        const star = starElements[i][0];
+        if (ratingsLoading || isSorting || !starData) return;
+
+        const star = starData[1]?.[i]?.[0];
         const trackUri: string = getTrackUri();
-        const oldRating = ratings[trackUri];
-        const newRating: number = ratingOverride !== null ? ratingOverride : getMouseoverRating(settings, star, i);
+        if (typeof trackUri !== "string" || !star) return;
 
-        let removePromise = null;
-        let addPromise = null;
+        const newRating: number = typeof ratingOverride === "number" ? ratingOverride : getMouseoverRating(settings, star, i);
+        if (!Number.isFinite(newRating)) return;
 
-        const FIVE_MIN = 5 * 60 * 1000;
-
-        const old = settings.averageRatings ? oldRating?.find((r) => Date.now() - r.time.getTime() <= FIVE_MIN) : oldRating?.[0];
-
-        // remove old rating
-        if (old) {
-            removePromise = handleRemoveRating(trackUri, old.rating, old.uid);
-
-            // If sync duplicate songs is enabled, remove the rating from all tracks with the same ISRC
-            if (settings.syncDuplicateSongs) {
-                (async () => {
-                    try {
-                        const tracksWithSameISRC = await api.getTracksWithSameISRC(trackUri.substring(14));
-                        for (const track of tracksWithSameISRC) {
-                            const trackUri = track.uri;
-                            if (trackUri in ratings) {
-                                await handleRemoveRating(trackUri, newRating);
-                            }
-                        }
-                    } catch (error) {
-                        console.error(error);
-                    }
-                })();
-            }
-        }
-
-        // add new rating
-        if (!old || old.rating !== newRating) {
-            addPromise = handleAddRating(trackUri, newRating);
-
-            // Like the track if it's rated above the like threshold
-            if (settings.likeThreshold !== "disabled" && newRating >= parseFloat(settings.likeThreshold)) {
-                api.addTrackToLikedSongs(trackUri);
-            }
-
-            // If sync duplicate songs is enabled, set the rating for all tracks with the same ISRC
-            if (settings.syncDuplicateSongs) {
-                (async () => {
-                    try {
-                        const tracksWithSameISRC = await api.getTracksWithSameISRC(trackUri.substring(14));
-                        for (const track of tracksWithSameISRC) {
-                            const trackUri = track.uri;
-                            await handleAddRating(trackUri, newRating);
-                        }
-                    } catch (error) {
-                        console.error(error);
-                    }
-                })();
-            }
-        }
-
-        Promise.allSettled([removePromise, addPromise].filter(Boolean)).finally(() => {
-            let tracklistStarData = findStars(trackUriToTrackId(trackUri));
-            if (tracklistStarData) {
-                setRating(tracklistStarData[1], getTrackRating(trackUri), tracklistStarData[2]);
-                tracklistStarData[0].style.visibility = !settings.averageRatings && oldRating?.[0]?.rating === newRating ? "hidden" : "visible";
-            }
-
-            updateNowPlayingWidget();
-            // The album average is derived from the in-memory ratings map, so
-            // refresh it immediately after a track rating changes.
-            scheduleAlbumStars();
-
-            clickListenerRunning = false;
+        void enqueueRatingChange(() => applyRatingChange(trackUri, newRating)).catch((error) => {
+            console.error("Could not apply rating change:", error);
+            api.showNotification("Error updating rating: " + ((error as any).message || "Unknown error"));
         });
     };
 }
@@ -727,6 +778,20 @@ function updateTracklist() {
     // Define CSS for different tracklist columns
 
     createStarsForTracklists(tracklists);
+}
+
+function scheduleTracklistUpdate() {
+    if (!settings?.showPlaylistStars || tracklistUpdateScheduled) return;
+
+    tracklistUpdateScheduled = true;
+    window.requestAnimationFrame(() => {
+        tracklistUpdateScheduled = false;
+        try {
+            updateTracklist();
+        } catch (error) {
+            console.error("Error updating track ratings:", error);
+        }
+    });
 }
 
 function createStarsForTracklists(tracklists: HTMLCollectionOf<Element>) {
@@ -843,52 +908,45 @@ function createStarsForTracklists(tracklists: HTMLCollectionOf<Element>) {
     }
 }
 
-function onClickShowPlaylistStars() {
-    if (settings.showPlaylistStars) updateTracklist();
-    else restoreTracklist();
+function removeWeightedShuffleButton() {
+    weightedShuffleButton?.remove();
+    weightedShuffleButton = null;
 }
 
-async function observerCallback(keys) {
-    oldMainElement = mainElement;
-    mainElement = document.querySelector("main");
-    if (mainElement && !mainElement.isEqualNode(oldMainElement)) {
-        if (oldMainElement) {
-            mainElementObserver.disconnect();
-        }
-        try {
-            updateTracklist();
-        } catch (error) {
-            console.error("Error updating track ratings:", error);
-        }
-        mainElementObserver.observe(mainElement, {
-            childList: true,
-            subtree: true,
-        });
+function updateWeightedShuffleButton() {
+    if (!weightedShuffleButton?.isConnected) return;
+
+    const enabled = weightedPlaybackEnabledForPlaylist();
+    weightedShuffleButton.style.backgroundColor = enabled ? "var(--background-press, #1db954)" : "transparent";
+    weightedShuffleButton.style.borderColor = enabled ? "var(--background-press, #1db954)" : "var(--essential-subdued, #878787)";
+    weightedShuffleButton.style.color = enabled ? "#1DB954" : "var(--text-subdued, #6a6a6a)";
+    weightedShuffleButton.title = enabled ? "Disable Weighted Shuffle" : "Enable Weighted Shuffle";
+}
+
+function refreshWeightedShuffleButton() {
+    if (!settings?.showWeightedShuffle) {
+        removeWeightedShuffleButton();
+        return;
     }
 
-    oldNowPlayingWidget = nowPlayingWidget;
-    let selector =
-        settings.nowPlayingStarsPosition === "left" ? ".main-nowPlayingWidget-nowPlaying .main-trackInfo-container" : ".main-nowPlayingBar-right div";
-    nowPlayingWidget = document.querySelector(selector);
-    if (nowPlayingWidget && !nowPlayingWidget.isEqualNode(oldNowPlayingWidget)) {
-        nowPlayingWidgetStarData = createStars("now-playing", 16);
-        nowPlayingWidgetStarData[0].style.marginLeft = "8px";
-        nowPlayingWidgetStarData[0].style.marginRight = "8px";
-        if (settings.nowPlayingStarsPosition === "left") nowPlayingWidget.after(nowPlayingWidgetStarData[0]);
-        else nowPlayingWidget.prepend(nowPlayingWidgetStarData[0]);
-        addStarsListeners(nowPlayingWidgetStarData, getNowPlayingTrackUri);
-        updateNowPlayingWidget();
-        if (settings.enableKeyboardShortcuts) {
-            getRegisterKeyboardShortcuts(keys)();
-        }
-    }
-
-    // Add weighted shuffle button to player controls
     const shuffleButton =
         document.querySelector('[data-testid="control-button-shuffle"]') || document.querySelector('button[aria-label*="Shuffle" i]');
+    const shuffleButtonParent = shuffleButton?.parentElement;
+    if (!shuffleButton || !shuffleButtonParent) {
+        removeWeightedShuffleButton();
+        return;
+    }
 
-    if (shuffleButton && !document.querySelector(".weighted-shuffle-button") && settings.showWeightedShuffle) {
-        const weightedShuffleButton = document.createElement("button");
+    if (weightedShuffleButton && (!weightedShuffleButton.isConnected || weightedShuffleButton.parentElement !== shuffleButtonParent)) {
+        removeWeightedShuffleButton();
+    }
+
+    if (!weightedShuffleButton) {
+        // A stale button can be left behind by Spotify remounting its player
+        // controls. Remove it rather than attaching a second listener.
+        document.querySelectorAll(".weighted-shuffle-button").forEach((button) => button.remove());
+
+        weightedShuffleButton = document.createElement("button");
         weightedShuffleButton.className = "weighted-shuffle-button";
         weightedShuffleButton.style.cssText = `
             margin-left: 8px;
@@ -905,34 +963,67 @@ async function observerCallback(keys) {
             font-size: 16px;
             font-weight: bold;
         `;
-
-        weightedShuffleButton.textContent = `W`;
-
-        weightedShuffleButton.title = "Weighted Shuffle";
-
-        function updateButtonStyle() {
-            weightedShuffleButton.style.backgroundColor = weightedPlaybackEnabledForPlaylist() ? "var(--background-press, #1db954)" : "transparent";
-            weightedShuffleButton.style.borderColor = weightedPlaybackEnabledForPlaylist()
-                ? "var(--background-press, #1db954)"
-                : "var(--essential-subdued, #878787)";
-            weightedShuffleButton.style.color = weightedPlaybackEnabledForPlaylist() ? "#1DB954" : "var(--text-subdued, #6a6a6a)";
-
-            weightedShuffleButton.title = weightedPlaybackEnabledForPlaylist() ? "Disable Weighted Shuffle" : "Enable Weighted Shuffle";
-        }
-
-        setInterval(updateButtonStyle, 500); // make sure this stays up-to-date across context changes. Could be improved.
-
+        weightedShuffleButton.textContent = "W";
         weightedShuffleButton.addEventListener("click", () => {
-            setWeightedPlaybackEnabledForPlaylist(!weightedPlaybackEnabledForPlaylist());
-            updateButtonStyle();
-
-            api.showNotification(weightedPlaybackEnabledForPlaylist() ? "Weighted shuffle enabled" : "Weighted shuffle disabled");
+            const nextEnabled = !weightedPlaybackEnabledForPlaylist();
+            setWeightedPlaybackEnabledForPlaylist(nextEnabled);
+            updateWeightedShuffleButton();
+            if (nextEnabled) requestWeightedQueueUpdate();
+            api.showNotification(nextEnabled ? "Weighted shuffle enabled" : "Weighted shuffle disabled");
         });
-
-        shuffleButton.parentNode.insertBefore(weightedShuffleButton, shuffleButton.nextSibling);
-
-        updateButtonStyle();
+        shuffleButtonParent.insertBefore(weightedShuffleButton, shuffleButton.nextSibling);
     }
+
+    updateWeightedShuffleButton();
+}
+
+function scheduleObserverCallback(keys) {
+    if (observerCallbackScheduled) return;
+
+    observerCallbackScheduled = true;
+    window.requestAnimationFrame(() => {
+        observerCallbackScheduled = false;
+        void observerCallback(keys);
+    });
+}
+
+async function observerCallback(keys) {
+    const nextMainElement = document.querySelector("main");
+    if (nextMainElement !== mainElement) {
+        mainElementObserver?.disconnect();
+        mainElement = nextMainElement;
+
+        if (mainElement) {
+            scheduleTracklistUpdate();
+            mainElementObserver?.observe(mainElement, {
+                childList: true,
+                subtree: true,
+            });
+        }
+    }
+
+    const selector =
+        settings.nowPlayingStarsPosition === "left" ? ".main-nowPlayingWidget-nowPlaying .main-trackInfo-container" : ".main-nowPlayingBar-right div";
+    const nextNowPlayingWidget = document.querySelector(selector);
+    if (nextNowPlayingWidget !== nowPlayingWidget) {
+        nowPlayingWidgetStarData?.[0]?.remove();
+        nowPlayingWidget = nextNowPlayingWidget;
+
+        if (nowPlayingWidget) {
+            nowPlayingWidgetStarData = createStars("now-playing", 16);
+            nowPlayingWidgetStarData[0].style.marginLeft = "8px";
+            nowPlayingWidgetStarData[0].style.marginRight = "8px";
+            if (settings.nowPlayingStarsPosition === "left") nowPlayingWidget.after(nowPlayingWidgetStarData[0]);
+            else nowPlayingWidget.prepend(nowPlayingWidgetStarData[0]);
+            addStarsListeners(nowPlayingWidgetStarData, getNowPlayingTrackUri);
+            updateNowPlayingWidget();
+            if (settings.enableKeyboardShortcuts) {
+                getRegisterKeyboardShortcuts(keys)();
+            }
+        }
+    }
+
+    refreshWeightedShuffleButton();
 }
 
 function updateAlbumStars() {
@@ -1085,16 +1176,17 @@ async function main() {
                 settings,
                 registerKeyboardShortcuts,
                 deregisterKeyboardShortcuts,
-                updateTracklist,
+                updateTracklist: scheduleTracklistUpdate,
                 restoreTracklist,
                 redrawNowPlayingStars,
+                refreshWeightedShuffleButton,
             }),
             isLarge: true,
         });
     }).register();
 
     mainElementObserver = new MutationObserver(() => {
-        updateTracklist();
+        scheduleTracklistUpdate();
     });
 
     Spicetify.Player.addEventListener("songchange", () => {
@@ -1111,6 +1203,8 @@ async function main() {
         }
 
         updateNowPlayingWidget();
+        updateWeightedShuffleButton();
+        requestWeightedQueueUpdate();
     });
 
     Spicetify.Platform.History.listen(() => {
@@ -1242,16 +1336,16 @@ async function main() {
     ).register();
 
     const observer = new MutationObserver(() => {
-        void observerCallback(keys);
+        scheduleObserverCallback(keys);
     });
     await observerCallback(keys);
     scheduleAlbumStars();
+    requestWeightedQueueUpdate();
     observer.observe(document.body, {
         childList: true,
         subtree: true,
     });
 
-    weightedLoop();
 }
 
 export default main;
