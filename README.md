@@ -1,5 +1,9 @@
 # Spicetify Star Ratings
-Add star ratings to Spotify
+
+Add and manage personal star ratings in Spotify with Spicetify.
+
+> This is an actively maintained fork. See [Project history](#project-history)
+> for the original projects this work builds on.
 
 ![banner](/imgs/preview.png)
 
@@ -9,9 +13,31 @@ Add star ratings to Spotify
 2. Install "Star Ratings" from the Marketplace
    <img src="imgs/install.png" height="600px" alt="install">
 
+## What's new in this fork
+
+- Album ratings appear under the album name and average only the songs you
+  have rated.
+- Album averages are saved locally, so a previously calculated value is ready
+  on later visits without repeatedly requesting album data from Spotify.
+- Album stars always show quarter-star precision: an average of **4.25** fills
+  one quarter of the fifth star, rather than rounding it to a half star.
+- Existing song-rating settings are retained, including the optional
+  quarter-star input mode.
+
+## Screenshots
+
+> **Album rating placeholder:** save a screenshot as
+> `imgs/album-rating.png`, then replace this note with
+> `![Album rating below the album title](imgs/album-rating.png)`.
+
+> **Quarter-star placeholder:** save a close-up as
+> `imgs/album-quarter-star.png`, then replace this note with
+> `![A 4.25 album rating](imgs/album-quarter-star.png)`.
+
 ## Settings
 
-Settings, such as enabling/disabling half star ratings, can be accessed from the menu at the top right
+Settings, including optional half- and quarter-star song ratings, can be
+accessed from the menu at the top right.
 ![Settings](imgs/settings.png)
 
 ## Implement List
@@ -54,6 +80,14 @@ The calculated value is cached locally in Spicetify storage and is refreshed
 when the album's rated rows render or a rating changes. This keeps the rating
 available on later visits without making album-page network requests.
 
+Album averages are rounded to the nearest quarter star and always use the
+quarter-filled star artwork. This is independent of the song-rating precision
+chosen in Settings.
+
+> **Album-page screenshot placeholder:** save a full album-page screenshot as
+> `imgs/album-page-rating.png`, then replace this note with
+> `![Album page with rating](imgs/album-page-rating.png)`.
+
 ## Star Rating Playlist Images
 
 <table>
@@ -85,14 +119,21 @@ available on later visits without making album-page network requests.
 https://github.com/jeroentvb/spicetify-playlist-icons provides a nice view of the playlist icons when you are adding to them manually ![alt text](imgs/example.png)
 
 ## It Doesn't Work!
-Please [open an issue](https://github.com/brimell/spicetify-star-ratings/issues/new), we want this extension to work as smoothly as possible!
+Please [open an issue](https://github.com/arionukshini/spicetify-star-ratings/issues/new)
+with your Spotify and Spicetify versions, plus a screenshot if possible.
 
 ## Performance
 The cost of adding a new rating scales with the size of the playlist the song is being added to. 
 So if you have a _lot_ of ratings, it may be beneficial to keep your currently active playlists decently small. To do this, you can adjust the `Max Playlist Items` in the settings, which automatically creates new playlists when the limit is reached.
 
+## Project history
+
+- This maintained fork: [arionukshini/spicetify-star-ratings](https://github.com/arionukshini/spicetify-star-ratings)
+- Working upstream fork: [brimell/spicetify-star-ratings](https://github.com/brimell/spicetify-star-ratings)
+- Original archived project: [Duffey's Spicetify Star Ratings](https://github.com/duffey/spicetify-star-ratings)
+
 ## Credits
 
-*Forked from [Duffey's Spicetify Star Ratings](https://github.com/duffey/spicetify-star-ratings) (archived)*
+This project builds on Duffey's original extension and brimell's working fork.
 
 *This extension was built with [Spicetify Creator](https://github.com/spicetify/spicetify-creator)*

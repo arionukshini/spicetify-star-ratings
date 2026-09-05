@@ -113,7 +113,18 @@ export function createStars(trackURI: string, size: number): [HTMLSpanElement, (
     return [stars, starElements, label];
 }
 
-export function setRating(starElements: (SVGSVGElement | SVGPathElement)[][], rating: number | null, label?: HTMLElement) {
+type StarDisplayOptions = {
+    // Album averages are calculated to quarter-star precision even when song
+    // rating input is configured for whole or half stars.
+    forceQuarterStars?: boolean;
+};
+
+export function setRating(
+    starElements: (SVGSVGElement | SVGPathElement)[][],
+    rating: number | null,
+    label?: HTMLElement,
+    options: StarDisplayOptions = {},
+) {
     const normalizedRating = typeof rating === "number" && Number.isFinite(rating) ? rating : 0;
     if (settings?.showExactRating && label) label.textContent = rating !== null && Number.isFinite(rating) ? rating.toFixed(2) : "";
 
@@ -129,7 +140,7 @@ export function setRating(starElements: (SVGSVGElement | SVGPathElement)[][], ra
         // Quarter-units filled within this individual star (0–4)
         const filled = Math.max(0, Math.min(4, totalQUnits - starBase));
 
-        if (settings?.quarterStarRatings) {
+        if (options.forceQuarterStars || settings?.quarterStarRatings) {
             // Fill order: BL → TL → TR → BR
             (blPath as SVGPathElement).setAttributeNS(null, "fill", filled >= 1 ? on : off);
             (tlPath as SVGPathElement).setAttributeNS(null, "fill", filled >= 2 ? on : off);

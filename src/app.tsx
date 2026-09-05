@@ -430,7 +430,9 @@ function updateAlbumRating() {
         return;
     }
 
-    setRating(albumStarData[1], average, albumStarData[2]);
+    // An album mean is meaningful at quarter-star precision. Preserve that
+    // visual precision even if song-rating input is set to half stars.
+    setRating(albumStarData[1], average, albumStarData[2], { forceQuarterStars: true });
     const exactAverage = average.toFixed(2);
     const countLabel = totalTracks > 0 ? `${ratedTracks}/${totalTracks} rated` : `${ratedTracks} rated`;
     if (albumRatingSummary) {
