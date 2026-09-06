@@ -26,13 +26,9 @@ Add and manage personal star ratings in Spotify with Spicetify.
 
 ## Screenshots
 
-> **Album rating placeholder:** save a screenshot as
-> `imgs/album-rating.png`, then replace this note with
-> `![Album rating below the album title](imgs/album-rating.png)`.
+<img src="imgs/album-rating.png" height="600px" alt="Album Rating">
 
-> **Quarter-star placeholder:** save a close-up as
-> `imgs/album-quarter-star.png`, then replace this note with
-> `![A 4.25 album rating](imgs/album-quarter-star.png)`.
+<img src="imgs/album-quarter-star.png" height="600px" alt="Quarter album rating">
 
 ## Settings
 
@@ -49,8 +45,6 @@ accessed from the menu at the top right.
 - [x] creating weigthed playlist
 - [x] rating averaging over time
 - [x] album ratings averaged from rated songs
-- [] option to show rateyourmusic ratings
-- [] option to upload ratings to rateyourmusic (they only do albums)
 
 ## Weighted Playback
 - Always keeps one weighted random track in queue.
@@ -83,10 +77,6 @@ available on later visits without making album-page network requests.
 Album averages are rounded to the nearest quarter star and always use the
 quarter-filled star artwork. This is independent of the song-rating precision
 chosen in Settings.
-
-> **Album-page screenshot placeholder:** save a full album-page screenshot as
-> `imgs/album-page-rating.png`, then replace this note with
-> `![Album page with rating](imgs/album-page-rating.png)`.
 
 ## Star Rating Playlist Images
 
