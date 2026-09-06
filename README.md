@@ -45,6 +45,9 @@ accessed from the menu at the top right.
 - [x] creating weigthed playlist
 - [x] rating averaging over time
 - [x] album ratings averaged from rated songs
+- [] ratings for local files
+- [] ratings for playlists option (maybe)
+- [] link on album for aoty album page
 
 ## Weighted Playback
 - Always keeps one weighted random track in queue.
