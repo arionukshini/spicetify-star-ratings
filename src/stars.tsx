@@ -1,4 +1,5 @@
 import { settings } from "./app";
+import type { Settings as SettingsType } from "./settings";
 
 /**
  * Format a rating number as a canonical string key.
@@ -10,24 +11,27 @@ export function toRatingString(rating: number): string {
     return rating.toFixed(2);
 }
 
-export function findStars(idSuffix: string) {
-    const starsId = `stars-${idSuffix}`;
-    const stars = document.getElementById(starsId);
-    if (!stars) return null;
+export type StarData = [HTMLSpanElement, (SVGSVGElement | SVGPathElement)[][], HTMLSpanElement | undefined];
 
-    const starElements = [];
-    for (let i = 1; i <= 5; i++) {
-        const id = `${starsId}-${i}`;
-        const star = document.getElementById(id);
-        const tl = document.getElementById(`${id}-tl`);
-        const bl = document.getElementById(`${id}-bl`);
-        const tr = document.getElementById(`${id}-tr`);
-        const br = document.getElementById(`${id}-br`);
+export function getStarDataFromElement(stars: HTMLSpanElement): StarData | null {
+    const starElements: (SVGSVGElement | SVGPathElement)[][] = [];
+    for (const star of Array.from(stars.querySelectorAll<SVGSVGElement>("svg"))) {
+        const tl = star.querySelector<SVGPathElement>('path[id$="-tl"]');
+        const bl = star.querySelector<SVGPathElement>('path[id$="-bl"]');
+        const tr = star.querySelector<SVGPathElement>('path[id$="-tr"]');
+        const br = star.querySelector<SVGPathElement>('path[id$="-br"]');
+        if (!tl || !bl || !tr || !br) return null;
         starElements.push([star, tl, bl, tr, br]);
     }
+    if (starElements.length !== 5) return null;
 
     const label = stars.querySelector(".stars-rating-label") as HTMLSpanElement | null;
-    return [stars, starElements, label];
+    return [stars, starElements, label ?? undefined];
+}
+
+export function findStars(idSuffix: string): StarData | null {
+    const stars = document.getElementById(`stars-${idSuffix}`) as HTMLSpanElement | null;
+    return stars ? getStarDataFromElement(stars) : null;
 }
 
 function createStar(starsId: string, n: number, size: number) {
@@ -84,7 +88,7 @@ function createStar(starsId: string, n: number, size: number) {
     return [star, paths[0], paths[1], paths[2], paths[3]] as const;
 }
 
-export function createStars(trackURI: string, size: number): [HTMLSpanElement, (SVGSVGElement | SVGPathElement)[][], HTMLSpanElement | undefined] {
+export function createStars(trackURI: string, size: number): StarData {
     const stars = document.createElement("span");
     const id = `stars-${trackURI}`;
     stars.className = "stars";
@@ -165,10 +169,15 @@ export function setRating(
     }
 }
 
-export function getMouseoverRating(settings, star, i) {
+export function getMouseoverRating(
+    settings: Pick<SettingsType, "quarterStarRatings" | "halfStarRatings">,
+    star: Element,
+    i: number,
+    mouseEvent: MouseEvent,
+): number {
     const rect = star.getBoundingClientRect();
-    const offsetX = (event as MouseEvent).clientX - rect.left;
-    const offsetY = (event as MouseEvent).clientY - rect.top;
+    const offsetX = mouseEvent.clientX - rect.left;
+    const offsetY = mouseEvent.clientY - rect.top;
 
     const isRight = offsetX > rect.width / 2;
     const isTop = offsetY < rect.height / 2;

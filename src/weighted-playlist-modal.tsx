@@ -7,7 +7,18 @@ interface WeightedPlaylistModalProps {
     onClickCreate: (trackCount: number) => void;
 }
 
-export function Button({ name, className, onButtonClick }) {
+interface ButtonProps {
+    name: string;
+    className: string;
+    onButtonClick: () => void;
+}
+
+interface NumberInputProps {
+    value: string;
+    onChange: (event: React.ChangeEvent<HTMLInputElement>) => void;
+}
+
+export function Button({ name, className, onButtonClick }: ButtonProps) {
     return (
         <button className={className} onClick={onButtonClick}>
             {name}
@@ -15,11 +26,13 @@ export function Button({ name, className, onButtonClick }) {
     );
 }
 
-function NumberInput({ value, onChange }) {
+function NumberInput({ value, onChange }: NumberInputProps) {
     return (
         <div className="weighted-playlist-input-container">
             <input
-                type="text"
+                type="number"
+                min={1}
+                step={1}
                 value={value}
                 onChange={onChange}
                 className="weighted-playlist-input"
@@ -32,13 +45,13 @@ function NumberInput({ value, onChange }) {
 export function WeightedPlaylistModal({ onClickCancel, onClickCreate }: WeightedPlaylistModalProps) {
     const [trackCountInput, setTrackCountInput] = React.useState("10");
 
-    function handleTrackCountChange(value: string) {
-        setTrackCountInput(value);
+    function handleTrackCountChange(event: React.ChangeEvent<HTMLInputElement>) {
+        setTrackCountInput(event.target.value);
     }
 
     function handleCreate() {
-        const count = parseInt(trackCountInput);
-        if (isNaN(count) || count <= 0) {
+        const count = Number(trackCountInput);
+        if (!Number.isInteger(count) || count <= 0) {
             alert("Please enter a valid positive number");
             return;
         }

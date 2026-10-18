@@ -53,6 +53,13 @@ export interface Settings {
     showWeightedShuffle: boolean;
 }
 
+const halfIncrementRatings: HalfIncrementRating[] = ["0.0", "0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5", "5.0"];
+const thresholds: Threshold[] = ["disabled", ...halfIncrementRatings];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 const defaultSettings: Settings = {
     halfStarRatings: true,
     quarterStarRatings: false,
@@ -75,29 +82,102 @@ const defaultSettings: Settings = {
 };
 
 export function getSettings(): Settings {
-    let settings: Partial<Settings> = {};
+    let stored: unknown;
     try {
-        const parsed = JSON.parse(api.getLocalStorageData("starRatings:settings"));
-        if (parsed && typeof parsed === "object") {
-            settings = parsed as Partial<Settings>;
-        } else {
-            throw "";
-        }
+        const raw = api.getLocalStorageData("starRatings:settings");
+        stored = raw ? JSON.parse(raw) : {};
     } catch {
-        api.setLocalStorageData("starRatings:settings", JSON.stringify(defaultSettings));
-        return { ...defaultSettings };
+        stored = {};
     }
+
+    const values = isRecord(stored) ? stored : {};
+    const settings: Settings = { ...defaultSettings };
     let modified = false;
     for (const key of Object.keys(defaultSettings) as (keyof Settings)[]) {
-        if (!(key in settings)) {
-            settings[key] = defaultSettings[key];
+        if (!(key in values)) modified = true;
+    }
+
+    const useBoolean = (key: keyof Settings) => {
+        const value = values[key];
+        if (typeof value === "boolean") settings[key] = value as never;
+        else if (key in values) modified = true;
+    };
+    useBoolean("halfStarRatings");
+    useBoolean("quarterStarRatings");
+    useBoolean("enableKeyboardShortcuts");
+    useBoolean("showPlaylistStars");
+    useBoolean("syncDuplicateSongs");
+    useBoolean("reEnqueueWorkaround");
+    useBoolean("averageRatings");
+    useBoolean("showExactRating");
+    useBoolean("showWeightedShuffle");
+
+    if (typeof values.maxPlaylistItems === "number" && Number.isFinite(values.maxPlaylistItems)) {
+        settings.maxPlaylistItems = Math.max(1, Math.min(10000, Math.floor(values.maxPlaylistItems)));
+        if (settings.maxPlaylistItems !== values.maxPlaylistItems) modified = true;
+    } else if ("maxPlaylistItems" in values) {
+        modified = true;
+    }
+
+    if (typeof values.nowPlayingStarsPosition === "string" && ["left", "right"].includes(values.nowPlayingStarsPosition)) {
+        settings.nowPlayingStarsPosition = values.nowPlayingStarsPosition as NowPlayingStarsPosition;
+    } else if ("nowPlayingStarsPosition" in values) {
+        modified = true;
+    }
+
+    if (typeof values.newRatingPosition === "string" && ["front", "back"].includes(values.newRatingPosition)) {
+        settings.newRatingPosition = values.newRatingPosition as NewRatingPosition;
+    } else if ("newRatingPosition" in values) {
+        modified = true;
+    }
+
+    if (typeof values.likeThreshold === "string" && thresholds.includes(values.likeThreshold as Threshold)) {
+        settings.likeThreshold = values.likeThreshold as Threshold;
+    } else if ("likeThreshold" in values) {
+        modified = true;
+    }
+
+    if (typeof values.skipThreshold === "string" && thresholds.includes(values.skipThreshold as Threshold)) {
+        settings.skipThreshold = values.skipThreshold as Threshold;
+    } else if ("skipThreshold" in values) {
+        modified = true;
+    }
+
+    if (typeof values.defaultRating === "string" && halfIncrementRatings.includes(values.defaultRating as HalfIncrementRating)) {
+        settings.defaultRating = values.defaultRating as HalfIncrementRating;
+    } else if ("defaultRating" in values) {
+        modified = true;
+    }
+
+    if (values.ratingToWeight === null || typeof values.ratingToWeight !== "object" || Array.isArray(values.ratingToWeight)) {
+        if ("ratingToWeight" in values) modified = true;
+    } else {
+        const scaling = values.ratingToWeight as Record<string, unknown>;
+        if (scaling.kind === "Linear") {
+            settings.ratingToWeight = { kind: "Linear" };
+        } else if (
+            scaling.kind === "Exponential" &&
+            typeof scaling.base === "number" &&
+            Number.isFinite(scaling.base) &&
+            scaling.base >= 0.01
+        ) {
+            settings.ratingToWeight = { kind: "Exponential", base: Math.min(100, scaling.base) };
+            if (settings.ratingToWeight.base !== scaling.base) modified = true;
+        } else {
             modified = true;
         }
     }
-    if (modified) {
+
+    if (values.play === "all" || values.play === "onlyrated" || values.play === "onlyunrated") {
+        settings.play = values.play;
+    } else if ("play" in values) {
+        modified = true;
+    }
+
+    if (modified || !isRecord(stored)) {
         api.setLocalStorageData("starRatings:settings", JSON.stringify(settings));
     }
-    return settings as Settings;
+    return settings;
 }
 
 export function saveSettings(settings: Settings) {
@@ -106,16 +186,17 @@ export function saveSettings(settings: Settings) {
 
 export function getPlaylistUris(): PlaylistUris {
     try {
-        const parsed = JSON.parse(api.getLocalStorageData("starRatings:playlistUris"));
+        const raw = api.getLocalStorageData("starRatings:playlistUris");
+        const parsed = raw ? JSON.parse(raw) : {};
         if (parsed && typeof parsed === "object") {
             const migrated: PlaylistUris = {};
             for (const [ratingStr, value] of Object.entries(parsed)) {
-                const rating = parseFloat(ratingStr);
-                if (isNaN(rating)) continue;
+                const rating = Number(ratingStr);
+                if (!Number.isFinite(rating) || rating < 0 || rating > 5 || Math.round(rating * 4) !== rating * 4) continue;
                 if (Array.isArray(value)) {
-                    migrated[rating] = value as string[];
-                } else if (typeof value === "string") {
-                    migrated[rating] = [value as string];
+                    migrated[rating] = value.filter((uri): uri is string => typeof uri === "string" && uri.length > 0);
+                } else if (typeof value === "string" && value.length > 0) {
+                    migrated[rating] = [value];
                 }
             }
             return migrated;
@@ -127,14 +208,14 @@ export function getPlaylistUris(): PlaylistUris {
     }
 }
 
-export function savePlaylistUris() {
-    api.setLocalStorageData("starRatings:playlistUris", JSON.stringify(playlistUris));
+export function savePlaylistUris(uris: PlaylistUris = playlistUris) {
+    api.setLocalStorageData("starRatings:playlistUris", JSON.stringify(uris));
 }
 
 export function getRatedFolderUri() {
     return api.getLocalStorageData("starRatings:ratedFolderUri");
 }
 
-export function saveRatedFolderUri(ratedFolderUri) {
+export function saveRatedFolderUri(ratedFolderUri: string) {
     api.setLocalStorageData("starRatings:ratedFolderUri", ratedFolderUri);
 }

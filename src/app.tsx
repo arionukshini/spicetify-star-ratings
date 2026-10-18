@@ -1,6 +1,6 @@
 import * as api from "./api";
 import { getCachedAlbumRating, saveCachedAlbumRating } from "./album-rating-cache";
-import { createStars, setRating, getMouseoverRating, findStars, toRatingString } from "./stars";
+import { createStars, setRating, getMouseoverRating, getStarDataFromElement, toRatingString, StarData } from "./stars";
 import { Settings, getSettings, saveSettings, getPlaylistUris, savePlaylistUris, getRatedFolderUri, saveRatedFolderUri } from "./settings";
 import { Settings as SettingsUi } from "./settings-ui";
 import { SortModal } from "./sort-modal";
@@ -23,34 +23,34 @@ import { tracklistColumnCss } from "./css/css";
 import {
     getTracklistTrackUri,
     isAlbumPage,
-    trackUriToTrackId,
     getNowPlayingTrackUri,
     weightedPlaybackEnabledForPlaylist,
     setWeightedPlaybackEnabledForPlaylist,
     getPlayerContext,
 } from "./utils/utils";
 
-export let settings: Settings | null = null;
+// Settings are loaded before any UI or player callbacks are registered.
+export let settings: Settings = null!;
 
 let ratedFolderUri: string | null = null;
 let ratings: Ratings = {};
-let playlistNames = {};
+let playlistNames: Record<string, string> = {};
 export let playlistUris: PlaylistUris = {};
 
-let originalTracklistHeaderCss = null;
-let originalTracklistTrackCss = null;
+let originalTracklistHeaderCss: string | null = null;
+let originalTracklistTrackCss: string | null = null;
 let mainElement: Element | null = null;
 let mainElementObserver: MutationObserver | null = null;
-let tracklists: HTMLCollectionOf<Element> = [];
-let oldTracklists = [];
+let tracklists: Element[] = [];
+let oldTracklists: Element[] = [];
 
 let nowPlayingWidget: Element | null = null;
 
 let albumId: string | null = null;
-let albumStarData = null;
+let albumStarData: StarData | null = null;
 let albumRatingSummary: HTMLSpanElement | null = null;
 let albumRefreshGeneration = 0;
-let nowPlayingWidgetStarData = null;
+let nowPlayingWidgetStarData: StarData | null = null;
 
 let ratingsLoading = false;
 let isSorting = false;
@@ -58,14 +58,18 @@ let ratingChangeQueue: Promise<void> = Promise.resolve();
 let tracklistUpdateScheduled = false;
 let observerCallbackScheduled = false;
 let weightedQueueUpdateInFlight = false;
+let weightedQueueUpdateRequested = false;
+let keyboardShortcutsRegistered = false;
 let weightedShuffleButton: HTMLButtonElement | null = null;
+let nextTrackStarId = 0;
+const weightedTrackCache = new Map<string, { uris: string[]; expiresAt: number }>();
 
 export function getTrackRating(trackUri: string): number | null {
     return getCanonicalRating(ratings, trackUri);
 }
 
 export function getTrackRatingOrDefault(trackUri: string): number {
-    return getTrackRating(trackUri) ?? parseFloat(settings.defaultRating);
+    return getTrackRating(trackUri) ?? parseFloat(settings?.defaultRating ?? "2.5");
 }
 
 // --- weighted playback ---
@@ -86,90 +90,66 @@ function getTrackWeight(trackUri: string): number {
     }
 }
 
-function selectWeightedRandomTrack(): Promise<string | null> {
-    return new Promise(async (resolve) => {
-        try {
-            const currentContext = getPlayerContext();
+async function getWeightedContextTrackUris(contextUri: string): Promise<string[]> {
+    const cached = weightedTrackCache.get(contextUri);
+    if (cached && cached.expiresAt > Date.now()) return cached.uris;
 
-            if (!currentContext || !currentContext.uri) {
-                resolve(null);
-                return;
-            }
+    let availableTracks: Array<{ uri?: string; link?: string }>;
+    if (contextUri.includes(":playlist:") || contextUri.includes(":playlist-v2:")) {
+        availableTracks = await api.getPlaylistItems(contextUri);
+    } else if (contextUri.startsWith("spotify:album:")) {
+        const album = await api.getAlbum(contextUri);
+        availableTracks = (album?.tracks?.items ?? []).map((track: { uri?: string; link?: string }) => ({ uri: track?.uri, link: track?.link }));
+    } else if (contextUri.includes("collection")) {
+        availableTracks = await api.getLikedSongsTracks();
+    } else {
+        return [];
+    }
 
-            let availableTracks = [];
+    const uris = availableTracks
+        .map((track) => track.link ?? track.uri)
+        .filter((uri): uri is string => typeof uri === "string" && uri.length > 0);
+    weightedTrackCache.set(contextUri, { uris, expiresAt: Date.now() + 30000 });
+    if (weightedTrackCache.size > 20) {
+        const oldestContext = weightedTrackCache.keys().next().value;
+        if (oldestContext) weightedTrackCache.delete(oldestContext);
+    }
+    return uris;
+}
 
-            if (currentContext.uri.includes("playlist")) {
-                // Get tracks from current playlist
-                const playlistUri = currentContext.uri;
-                availableTracks = await api.getPlaylistItems(playlistUri);
-            } else if (currentContext.uri.includes("album")) {
-                // Get tracks from current album
-                const albumId = currentContext.uri.split(":").pop();
-                const album = await api.getAlbum(albumId);
-                availableTracks = album.tracks.items.map((track) => ({
-                    uri: track.uri,
-                    link: track.uri,
-                }));
-            } else if (currentContext.uri.includes("collection")) {
-                availableTracks = await api.getLikedSongsTracks();
-            } else {
-                resolve(null);
-                return;
-            }
+async function selectWeightedRandomTrack(contextUri: string): Promise<string | null> {
+    try {
+        const availableTrackUris = await getWeightedContextTrackUris(contextUri);
+        const queuedUris = new Set(getQueuedTracks().map((track) => track.uri));
+        const currentTrackUri = Spicetify.Player?.data?.item?.uri;
+        const eligibleTracks = availableTrackUris
+            .filter((uri) => uri !== currentTrackUri && !queuedUris.has(uri));
+        if (eligibleTracks.length === 0) return null;
 
-            const availableTrackLinks = availableTracks.map((track) => track.link ?? track.uri);
+        const weights = eligibleTracks.map((uri) => getTrackWeight(uri));
+        const totalWeight = weights.reduce((sum, weight) => sum + (Number.isFinite(weight) && weight > 0 ? weight : 0), 0);
+        if (!Number.isFinite(totalWeight) || totalWeight <= 0) return null;
 
-            if (availableTrackLinks.length === 0) {
-                resolve(null);
-                return;
-            }
-
-            // Filter out tracks that are already in queue or currently playing
-            const currentTrackUri = Spicetify.Player.data.item?.uri;
-            const queuedTracks = getQueuedTracks();
-
-            const eligibleTracks = availableTrackLinks.filter(
-                (track) => track !== currentTrackUri && !queuedTracks.some((queued) => queued.uri === track),
-            );
-
-            if (eligibleTracks.length === 0) {
-                resolve(null);
-                return;
-            }
-
-            // Calculate weights and perform weighted random selection
-            const weights = eligibleTracks.map((track) => getTrackWeight(track));
-            const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
-
-            if (totalWeight <= 0) {
-                resolve(null);
-                return;
-            }
-
-            let randomValue = Math.random() * totalWeight;
-            for (let i = 0; i < eligibleTracks.length; i++) {
-                randomValue -= weights[i];
-                if (randomValue <= 0) {
-                    resolve(eligibleTracks[i]);
-                    return;
-                }
-            }
-
-            resolve(eligibleTracks[eligibleTracks.length - 1]);
-        } catch (error) {
-            console.error("Error in weighted track selection:", error);
-            resolve(null);
+        let randomValue = Math.random() * totalWeight;
+        for (let i = 0; i < eligibleTracks.length; i++) {
+            const weight = Number.isFinite(weights[i]) && weights[i] > 0 ? weights[i] : 0;
+            randomValue -= weight;
+            if (randomValue < 0) return eligibleTracks[i];
         }
-    });
+
+        return eligibleTracks[eligibleTracks.length - 1];
+    } catch (error) {
+        console.error("Error in weighted track selection:", error);
+        return null;
+    }
 }
 
 function getQueuedTracks(): Array<{ uri: string }> {
     try {
-        return Spicetify.Queue.nextTracks
-            .filter((track) => track.provider === "queue")
-            .map((track) => ({
-                uri: track.contextTrack.uri,
-            }));
+        const nextTracks = (Spicetify.Queue?.nextTracks ?? []) as Array<{ provider?: string; contextTrack?: { uri?: string } }>;
+        return nextTracks.flatMap((track) =>
+            track.provider === "queue" && typeof track.contextTrack?.uri === "string" ? [{ uri: track.contextTrack.uri }] : [],
+        );
     } catch (e) {
         console.log("Failed to get queued tracks:", e);
         return [];
@@ -177,17 +157,23 @@ function getQueuedTracks(): Array<{ uri: string }> {
 }
 
 async function addWeightedTrackToQueue(): Promise<boolean> {
-    if (!weightedPlaybackEnabledForPlaylist()) return false;
+    const contextUri = getPlayerContext()?.uri;
+    if (typeof contextUri !== "string" || !contextUri || !weightedPlaybackEnabledForPlaylist()) return false;
 
     try {
-        const trackUri = await selectWeightedRandomTrack();
+        const trackUri = await selectWeightedRandomTrack(contextUri);
         if (!trackUri) return false;
+        if (getPlayerContext()?.uri !== contextUri || !weightedPlaybackEnabledForPlaylist()) return false;
+        // The player queue can change while the playlist request is in flight.
+        // Respect a user's new queue instead of appending behind it.
+        if (!shouldAddWeightedTrack()) return false;
 
         await Spicetify.addToQueue([{ uri: trackUri }]);
 
         // ensure track was actually enqueued, work-around for an issue with remote play
         if (settings.reEnqueueWorkaround) {
             await new Promise((r) => setTimeout(r, 1000)); // anything significantly shorter than 1s doesn't seem to work
+            if (getPlayerContext()?.uri !== contextUri || !weightedPlaybackEnabledForPlaylist()) return true;
             if (
                 !getQueuedTracks()
                     .map((track) => track.uri)
@@ -211,7 +197,10 @@ function shouldAddWeightedTrack(): boolean {
 }
 
 function requestWeightedQueueUpdate() {
-    if (weightedQueueUpdateInFlight) return;
+    if (weightedQueueUpdateInFlight) {
+        weightedQueueUpdateRequested = true;
+        return;
+    }
 
     weightedQueueUpdateInFlight = true;
     void (async () => {
@@ -223,51 +212,37 @@ function requestWeightedQueueUpdate() {
             console.error("Error updating weighted queue:", error);
         } finally {
             weightedQueueUpdateInFlight = false;
+            if (weightedQueueUpdateRequested) {
+                weightedQueueUpdateRequested = false;
+                requestWeightedQueueUpdate();
+            }
         }
     })();
 }
 
 // --- weighted playlist ---
 
-async function createWeightedShufflePlaylist(originalPlaylistUri: string, trackCount: number): Promise<any> {
+async function createWeightedShufflePlaylist(originalPlaylistUri: string, trackCount: number): Promise<string | null> {
     try {
-        // Get the original playlist name
+        // Read and select before creating the destination so a failed fetch or
+        // an unusable set of weights does not leave an empty playlist behind.
         const originalPlaylist = await api.getPlaylistMetadata(originalPlaylistUri);
-        const originalName = originalPlaylist.name;
+        const originalName = typeof originalPlaylist?.name === "string" ? originalPlaylist.name : "Playlist";
         const weightedName = `${originalName} (Weighted ${trackCount})`;
-
-        // Create the new weighted shuffle playlist
-        let weightedPlaylist;
-        try {
-            weightedPlaylist = await api.createPlaylist(weightedName, "");
-        } catch (error) {
-            // If playlist already exists, try with a suffix
-            let suffix = 1;
-            while (suffix <= 100) {
-                try {
-                    weightedPlaylist = await api.createPlaylist(`${weightedName} (${suffix})`, "");
-                    break;
-                } catch (e) {
-                    suffix++;
-                }
-            }
-            if (!weightedPlaylist) {
-                throw new Error("Unable to create weighted playlist");
-            }
-        }
 
         // Get all tracks from the original playlist
         const tracks = await api.getPlaylistItems(originalPlaylistUri);
-        if (tracks.length === 0) return weightedPlaylist;
+        if (tracks.length === 0) throw new Error("The source playlist has no tracks");
 
         // Calculate weights for all tracks
-        const tracksWithWeights = tracks.map((track) => ({
-            uri: track.link ?? track.uri,
-            weight: getTrackWeight(track.link ?? track.uri),
-        }));
+        const tracksWithWeights = tracks
+            .map((track) => track.link ?? track.uri)
+            .filter((uri): uri is string => typeof uri === "string" && uri.length > 0)
+            .map((uri) => ({ uri, weight: getTrackWeight(uri) }));
 
-        // Filter out tracks with zero weight (unlikely but possible)
-        const validTracks = tracksWithWeights.filter((track) => track.weight > 0);
+        // Ignore unusable weights so malformed settings or partial metadata
+        // cannot result in NaN output or an infinite sampling loop.
+        const validTracks = tracksWithWeights.filter((track) => Number.isFinite(track.weight) && track.weight > 0);
 
         if (validTracks.length === 0) {
             throw new Error("No tracks with valid weights found");
@@ -278,6 +253,11 @@ async function createWeightedShufflePlaylist(originalPlaylistUri: string, trackC
 
         if (selectedTracks.length === 0) {
             throw new Error("No tracks could be selected");
+        }
+
+        const weightedPlaylist = await api.createPlaylist(weightedName, "");
+        if (typeof weightedPlaylist !== "string" || !weightedPlaylist) {
+            throw new Error("Spotify did not return the new playlist URI");
         }
 
         // Add tracks to the weighted playlist in batches
@@ -296,28 +276,19 @@ async function createWeightedShufflePlaylist(originalPlaylistUri: string, trackC
 }
 
 function selectWeightedTracks(tracks: Array<{ uri: string; weight: number }>, count: number): Array<{ uri: string; weight: number }> {
-    const selected: Array<{ uri: string; weight: number }> = [];
+    if (!Number.isFinite(count) || count <= 0) return [];
 
-    for (let i = 0; i < count; i++) {
-        // Calculate total weight of remaining tracks
-        const totalWeight = tracks.reduce((sum, track) => sum + track.weight, 0);
-
-        if (totalWeight <= 0) break;
-
-        // Select a random value
-        let randomValue = Math.random() * totalWeight;
-
-        // Find the track that corresponds to this random value
-        for (const track of tracks) {
-            randomValue -= track.weight;
-            if (randomValue <= 0) {
-                selected.push(track);
-                break;
-            }
-        }
-    }
-
-    return selected;
+    // Exponential-race sampling chooses a weighted subset without replacement
+    // in O(n log n), so large playlists do not degrade to O(n × count).
+    return tracks
+        .filter((track) => Number.isFinite(track.weight) && track.weight > 0)
+        .map((track) => ({
+            track,
+            key: -Math.log(Math.max(Math.random(), Number.MIN_VALUE)) / track.weight,
+        }))
+        .sort((left, right) => left.key - right.key)
+        .slice(0, Math.min(Math.floor(count), tracks.length))
+        .map(({ track }) => track);
 }
 
 function findAlbumHeader(): Element | null {
@@ -585,18 +556,20 @@ function enqueueRatingChange(operation: () => Promise<void>) {
 }
 
 async function getRatingTargetTrackUris(trackUri: string): Promise<string[]> {
-    if (!settings.syncDuplicateSongs) return [trackUri];
+    if (!settings.syncDuplicateSongs || !trackUri.startsWith("spotify:track:")) return [trackUri];
 
     try {
         const tracksWithSameISRC = await api.getTracksWithSameISRC(trackUri.substring("spotify:track:".length));
         const trackUris = new Set([trackUri]);
+        const sourceLatestRating = ratings[trackUri]?.[0]?.rating;
 
         for (const track of tracksWithSameISRC) {
             const duplicateUri = track?.uri;
-            // Keep an existing duplicate's individual rating intact. This is
-            // the behavior advertised by the setting and avoids overwriting
-            // ratings made before duplicate sync was enabled.
-            if (typeof duplicateUri === "string" && !ratings[duplicateUri]?.length) {
+            const duplicateLatestRating = typeof duplicateUri === "string" ? ratings[duplicateUri]?.[0]?.rating : undefined;
+            // Leave independently rated releases alone, but keep matching
+            // releases in sync on later changes when their latest rating is
+            // still the same as the source track's latest rating.
+            if (typeof duplicateUri === "string" && (!ratings[duplicateUri]?.length || duplicateLatestRating === sourceLatestRating)) {
                 trackUris.add(duplicateUri);
             }
         }
@@ -620,19 +593,36 @@ async function applyRatingToTrack(trackUri: string, newRating: number, showNotif
 
     if (!oldRating || oldRating.rating !== newRating) {
         const didAddRating = await handleAddRating(trackUri, newRating, showNotification);
-        if (didAddRating && settings.likeThreshold !== "disabled" && newRating >= parseFloat(settings.likeThreshold)) {
+        if (!didAddRating && oldRating) {
+            // Re-adding can fail after removal (for example, if Spotify drops
+            // the request). Try to restore the previous rating so one failed
+            // update does not silently erase it.
+            const restored = await handleAddRating(trackUri, oldRating.rating, false);
+            if (!restored) {
+                api.showNotification("Could not save the new rating or restore the previous one.");
+            }
+        }
+        if (
+            didAddRating &&
+            !trackUri.startsWith("spotify:local:") &&
+            settings.likeThreshold !== "disabled" &&
+            newRating >= parseFloat(settings.likeThreshold)
+        ) {
             void api.addTrackToLikedSongs(trackUri).catch((error) => console.error("Could not add rated track to Liked Songs:", error));
         }
     }
 }
 
 function refreshTrackRatingUi(trackUri: string) {
-    const tracklistStarData = findStars(trackUriToTrackId(trackUri));
-    if (!tracklistStarData) return;
-
     const currentRating = getTrackRating(trackUri);
-    setRating(tracklistStarData[1], currentRating, tracklistStarData[2]);
-    tracklistStarData[0].style.visibility = currentRating === null ? "hidden" : "visible";
+    const starContainers = Array.from(document.querySelectorAll<HTMLSpanElement>(".starRatings .stars[data-track-uri]"));
+    for (const stars of starContainers) {
+        if (stars.dataset.trackUri !== trackUri) continue;
+        const starData = getStarDataFromElement(stars);
+        if (!starData) continue;
+        setRating(starData[1], currentRating, starData[2]);
+        starData[0].style.visibility = currentRating === null ? "hidden" : "visible";
+    }
 }
 
 async function applyRatingChange(trackUri: string, newRating: number) {
@@ -658,15 +648,23 @@ async function applyRatingChange(trackUri: string, newRating: number) {
     scheduleAlbumStars();
 }
 
-function getClickListener(i, ratingOverride, starData, getTrackUri) {
-    return () => {
+function getClickListener(
+    i: number,
+    ratingOverride: number | null,
+    getStarData: () => StarData | null,
+    getTrackUri: () => string | null,
+) {
+    return (event: Event) => {
+        const starData = getStarData();
         if (ratingsLoading || isSorting || !starData) return;
 
         const star = starData[1]?.[i]?.[0];
-        const trackUri: string = getTrackUri();
-        if (typeof trackUri !== "string" || !star) return;
+        const trackUri = getTrackUri();
+        if (typeof trackUri !== "string" || !trackUri.startsWith("spotify:track:") || !star) return;
 
-        const newRating: number = typeof ratingOverride === "number" ? ratingOverride : getMouseoverRating(settings, star, i);
+        if (typeof ratingOverride !== "number" && !(event instanceof MouseEvent)) return;
+        const newRating: number =
+            typeof ratingOverride === "number" ? ratingOverride : getMouseoverRating(settings, star, i, event as MouseEvent);
         if (!Number.isFinite(newRating)) return;
 
         void enqueueRatingChange(() => applyRatingChange(trackUri, newRating)).catch((error) => {
@@ -676,8 +674,9 @@ function getClickListener(i, ratingOverride, starData, getTrackUri) {
     };
 }
 
-function getRegisterKeyboardShortcuts(keys) {
+function getRegisterKeyboardShortcuts(keys: Record<string, string>) {
     return () => {
+        if (keyboardShortcutsRegistered) return;
         for (const [rating, key] of Object.entries(keys)) {
             Spicetify.Keyboard.registerShortcut(
                 {
@@ -685,14 +684,16 @@ function getRegisterKeyboardShortcuts(keys) {
                     ctrl: true,
                     alt: true,
                 },
-                getClickListener(0, parseFloat(rating), nowPlayingWidgetStarData, getNowPlayingTrackUri),
+                getClickListener(0, parseFloat(rating), () => nowPlayingWidgetStarData, getNowPlayingTrackUri),
             );
         }
+        keyboardShortcutsRegistered = true;
     };
 }
 
-function getDeregisterKeyboardShortcuts(keys) {
+function getDeregisterKeyboardShortcuts(keys: Record<string, string>) {
     return () => {
+        if (!keyboardShortcutsRegistered) return;
         for (const key of Object.values(keys)) {
             Spicetify.Keyboard._deregisterShortcut({
                 key: key,
@@ -700,12 +701,13 @@ function getDeregisterKeyboardShortcuts(keys) {
                 alt: true,
             });
         }
+        keyboardShortcutsRegistered = false;
     };
 }
 
-function addStarsListeners(starData, getTrackUri) {
-    function getCurrentRating(trackUri: string) {
-        return getTrackRating(trackUri) ?? 0.0;
+function addStarsListeners(starData: StarData, getTrackUri: () => string | null) {
+    function getCurrentRating(trackUri: string | null) {
+        return (typeof trackUri === "string" ? getTrackRating(trackUri) : null) ?? 0.0;
     }
 
     const [stars, starElements, label] = starData;
@@ -717,25 +719,27 @@ function addStarsListeners(starData, getTrackUri) {
     for (let i = 0; i < 5; i++) {
         const star = starElements[i][0];
 
-        star.addEventListener("mousemove", function () {
-            const rating = getMouseoverRating(settings, star, i);
+        star.addEventListener("mousemove", function (event) {
+            if (!(event instanceof MouseEvent)) return;
+            const rating = getMouseoverRating(settings, star, i, event);
             setRating(starElements, rating, label);
         });
 
-        star.addEventListener("click", getClickListener(i, null, starData, getTrackUri));
+        star.addEventListener("click", getClickListener(i, null, () => starData, getTrackUri));
     }
 }
 
 function restoreTracklist() {
     const tracklistHeaders = document.querySelectorAll(".main-trackList-trackListHeaderRow");
     tracklistHeaders.forEach((tracklistHeader) => {
-        tracklistHeader.style["grid-template-columns"] = originalTracklistHeaderCss;
+        const header = tracklistHeader as HTMLElement;
+        if (originalTracklistHeaderCss) header.style.gridTemplateColumns = originalTracklistHeaderCss;
         const ratingHeader = tracklistHeader.querySelector(".starRatingsHeader");
         if (ratingHeader) {
             ratingHeader.remove();
-            let lastColumn = tracklistHeader.querySelector(".main-trackList-rowSectionEnd");
-            let colIndexInt = parseInt(lastColumn.getAttribute("aria-colindex"));
-            lastColumn.setAttribute("aria-colindex", (colIndexInt - 1).toString());
+            const lastColumn = tracklistHeader.querySelector<HTMLElement>(".main-trackList-rowSectionEnd");
+            const colIndex = Number.parseInt(lastColumn?.getAttribute("aria-colindex") ?? "", 10);
+            if (lastColumn && Number.isFinite(colIndex)) lastColumn.setAttribute("aria-colindex", String(colIndex - 1));
         }
     });
 
@@ -744,11 +748,11 @@ function restoreTracklist() {
         for (const track of Array.from(tracks)) {
             let ratingColumn = track.querySelector(".starRatings");
             if (!ratingColumn) continue;
-            track.style["grid-template-columns"] = originalTracklistTrackCss;
+            if (originalTracklistTrackCss) (track as HTMLElement).style.gridTemplateColumns = originalTracklistTrackCss;
             ratingColumn.remove();
-            let lastColumn = track.querySelector(".main-trackList-rowSectionEnd");
-            let colIndexInt = parseInt(lastColumn.getAttribute("aria-colindex"));
-            lastColumn.setAttribute("aria-colindex", (colIndexInt - 1).toString());
+            const lastColumn = track.querySelector<HTMLElement>(".main-trackList-rowSectionEnd");
+            const colIndex = Number.parseInt(lastColumn?.getAttribute("aria-colindex") ?? "", 10);
+            if (lastColumn && Number.isFinite(colIndex)) lastColumn.setAttribute("aria-colindex", String(colIndex - 1));
         }
     }
 }
@@ -757,17 +761,10 @@ function updateTracklist() {
     // Check if showing playlist stars is enabled
     if (!settings.showPlaylistStars) return;
 
-    // Store current tracklists as oldTracklists
     oldTracklists = tracklists;
-    // Update tracklists
     tracklists = Array.from(document.querySelectorAll(".main-trackList-indexable"));
-    // Check if tracklists have changed
-    let tracklistsChanged = tracklists.length !== oldTracklists.length;
-
-    // Check if individual tracklists have changed
-    for (let i = 0; i < tracklists.length; i++) {
-        if (!tracklists[i].isEqualNode(oldTracklists[i])) tracklistsChanged = true;
-    }
+    const tracklistsChanged =
+        tracklists.length !== oldTracklists.length || tracklists.some((tracklist, index) => tracklist !== oldTracklists[index]);
 
     // Reset CSS if tracklists have changed
     if (tracklistsChanged) {
@@ -794,7 +791,7 @@ function scheduleTracklistUpdate() {
     });
 }
 
-function createStarsForTracklists(tracklists: HTMLCollectionOf<Element>) {
+function createStarsForTracklists(tracklists: Element[]) {
     // Store new tracklist header CSS
     let newTracklistHeaderCss = null;
     const tracklistHeaders = document.querySelectorAll(".main-trackList-trackListHeaderRow");
@@ -802,13 +799,14 @@ function createStarsForTracklists(tracklists: HTMLCollectionOf<Element>) {
     tracklistHeaders.forEach((tracklistHeader) => {
         if (tracklistHeader.querySelector(".starRatingsHeader")) return; // already injected
 
-        let lastColumn = tracklistHeader.querySelector(".main-trackList-rowSectionEnd");
-        let colIndexInt = parseInt(lastColumn.getAttribute("aria-colindex"));
+        const lastColumn = tracklistHeader.querySelector<HTMLElement>(".main-trackList-rowSectionEnd");
+        const colIndexInt = Number.parseInt(lastColumn?.getAttribute("aria-colindex") ?? "", 10);
+        if (!lastColumn || !Number.isFinite(colIndexInt)) return;
 
         // Set tracklist header CSS based on column index
         if (!originalTracklistHeaderCss) originalTracklistHeaderCss = getComputedStyle(tracklistHeader).gridTemplateColumns;
         if (originalTracklistHeaderCss && tracklistColumnCss[colIndexInt]) {
-            tracklistHeader.style["grid-template-columns"] = tracklistColumnCss[colIndexInt];
+            (tracklistHeader as HTMLElement).style.gridTemplateColumns = tracklistColumnCss[colIndexInt];
             newTracklistHeaderCss = tracklistColumnCss[colIndexInt];
         }
 
@@ -836,74 +834,77 @@ function createStarsForTracklists(tracklists: HTMLCollectionOf<Element>) {
 
     // Iterate through each tracklist
     for (const tracklist of tracklists) {
-        const tracks = tracklist.getElementsByClassName("main-trackList-trackListRow");
+        const tracks = Array.from(tracklist.getElementsByClassName("main-trackList-trackListRow"));
         // Iterate through each track
         for (const track of tracks) {
-            // Function to get heart element of the track
-            const getHeart = () => {
-                return (
-                    track.getElementsByClassName("main-addButton-button")[0] ??
-                    track.querySelector(".main-trackList-rowHeartButton") ??
-                    track.querySelector("button[class*='buttonTertiary-iconOnly']") ??
-                    track.querySelector("button[aria-label='Add to playlist']")
-                );
-            };
-            const hasStars = track.getElementsByClassName("stars").length > 0;
+            const trackElement = track as HTMLElement;
             const trackUri = getTracklistTrackUri(track);
-            const isTrack = typeof trackUri === "string" && trackUri.includes("track");
+            const isTrack = typeof trackUri === "string" && trackUri.startsWith("spotify:track:");
 
             let ratingColumn = track.querySelector(".starRatings");
             // Add column for stars if not already present
             if (!ratingColumn) {
-                let lastColumn = track.querySelector(".main-trackList-rowSectionEnd");
-                let colIndexInt = parseInt(lastColumn.getAttribute("aria-colindex"));
+                const lastColumn = track.querySelector<HTMLElement>(".main-trackList-rowSectionEnd");
+                const colIndexInt = Number.parseInt(lastColumn?.getAttribute("aria-colindex") ?? "", 10);
+                if (!lastColumn || !Number.isFinite(colIndexInt)) continue;
 
                 lastColumn.setAttribute("aria-colindex", (colIndexInt + 1).toString());
                 ratingColumn = document.createElement("div");
                 ratingColumn.setAttribute("aria-colindex", colIndexInt.toString());
                 ratingColumn.role = "gridcell";
-                ratingColumn.style.display = "flex";
+                (ratingColumn as HTMLElement).style.display = "flex";
                 ratingColumn.classList.add("main-trackList-rowSectionVariable");
                 ratingColumn.classList.add("starRatings");
                 track.insertBefore(ratingColumn, lastColumn);
 
                 if (!originalTracklistTrackCss) originalTracklistTrackCss = getComputedStyle(track).gridTemplateColumns;
                 if (tracklistColumnCss[colIndexInt])
-                    track.style["grid-template-columns"] = newTracklistHeaderCss ? newTracklistHeaderCss : tracklistColumnCss[colIndexInt];
+                    trackElement.style.gridTemplateColumns = newTracklistHeaderCss ? newTracklistHeaderCss : tracklistColumnCss[colIndexInt];
             }
 
-            // Continue to the next track if no heart, no track URI, has stars already, or not a track
-            if (!trackUri || hasStars || !isTrack) continue;
+            let existingStars = ratingColumn.querySelector<HTMLSpanElement>(".stars");
+            if (existingStars && existingStars.dataset.trackUri !== trackUri) {
+                existingStars.remove();
+                existingStars = null;
+            }
+
+            if (!isTrack || !trackUri) {
+                existingStars?.remove();
+                continue;
+            }
+
+            if (existingStars) continue;
 
             // Create stars for the track and set its rating
-            const starData = createStars(trackUriToTrackId(trackUri), 16);
+            const starData = createStars(`track-row-${++nextTrackStarId}`, 16);
             const stars = starData[0];
             const starElements = starData[1];
             const label = starData[2];
+            stars.dataset.trackUri = trackUri;
             const currentRating = getTrackRating(trackUri) ?? 0.0;
 
             // Append stars to rating column and set listeners
             ratingColumn.appendChild(stars);
             setRating(starElements, currentRating, label);
-            addStarsListeners(
-                starData,
-                () => {
-                    return trackUri;
-                },
-                getHeart,
-            );
+            addStarsListeners(starData, () => stars.dataset.trackUri ?? null);
 
             // Set visibility of stars based on rating
             stars.style.visibility = typeof ratings[trackUri] !== "undefined" ? "visible" : "hidden";
 
-            // Add listeners for hovering over a track in the tracklist
-            track.addEventListener("mouseover", () => {
-                stars.style.visibility = "visible";
-            });
-
-            track.addEventListener("mouseout", () => {
-                stars.style.visibility = typeof ratings[trackUri] !== "undefined" ? "visible" : "hidden";
-            });
+            // A virtualized Spotify row can be reused for a different song.
+            // Attach hover handlers once and read its current star container.
+            if (trackElement.dataset.starRatingsHoverListeners !== "true") {
+                trackElement.dataset.starRatingsHoverListeners = "true";
+                trackElement.addEventListener("mouseover", () => {
+                    const currentStars = trackElement.querySelector<HTMLElement>(".starRatings .stars");
+                    if (currentStars) currentStars.style.visibility = "visible";
+                });
+                trackElement.addEventListener("mouseout", () => {
+                    const currentStars = trackElement.querySelector<HTMLElement>(".starRatings .stars");
+                    const currentUri = currentStars?.dataset.trackUri;
+                    if (currentStars) currentStars.style.visibility = currentUri && ratings[currentUri] ? "visible" : "hidden";
+                });
+            }
         }
     }
 }
@@ -977,17 +978,57 @@ function refreshWeightedShuffleButton() {
     updateWeightedShuffleButton();
 }
 
-function scheduleObserverCallback(keys) {
+function scheduleObserverCallback(keys: Record<string, string>) {
     if (observerCallbackScheduled) return;
 
     observerCallbackScheduled = true;
     window.requestAnimationFrame(() => {
         observerCallbackScheduled = false;
-        void observerCallback(keys);
+        void observerCallback(keys).catch((error) => console.error("Error updating Star Ratings app controls:", error));
     });
 }
 
-async function observerCallback(keys) {
+function isTracklistMutationRelevant(records: MutationRecord[]): boolean {
+    const tracklistSelectors = ".main-trackList-indexable, .main-trackList-trackListRow, .main-trackList-trackListHeaderRow";
+    const extensionSelectors = ".starRatings, .starRatingsHeader";
+
+    return records.some((record) => {
+        const target = record.target instanceof Element ? record.target : record.target.parentElement;
+        if (target?.closest(extensionSelectors)) return false;
+
+        const changedElements = [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)].filter(
+            (node): node is Element => node instanceof Element,
+        );
+        if (
+            changedElements.length > 0 &&
+            changedElements.every((element) => element.matches(extensionSelectors) || !!element.closest(extensionSelectors))
+        ) {
+            return false;
+        }
+
+        if (target?.closest(".main-trackList-trackListRow, .main-trackList-trackListHeaderRow")) return true;
+        return changedElements.some((element) => element.matches(tracklistSelectors) || !!element.querySelector(tracklistSelectors));
+    });
+}
+
+function isAppChromeMutationRelevant(records: MutationRecord[]): boolean {
+    if (document.querySelector("main") !== mainElement) return true;
+
+    const playerSelectors =
+        ".main-nowPlayingWidget-nowPlaying, .main-nowPlayingBar-right, [data-testid='control-button-shuffle'], button[aria-label*='Shuffle' i]";
+    return records.some((record) => {
+        const target = record.target instanceof Element ? record.target : record.target.parentElement;
+        if (target?.closest(".stars")) return false;
+        if (target?.closest(playerSelectors)) return true;
+
+        return [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)].some((node) => {
+            if (!(node instanceof Element)) return false;
+            return node.matches(playerSelectors) || !!node.querySelector(playerSelectors);
+        });
+    });
+}
+
+async function observerCallback(keys: Record<string, string>) {
     const nextMainElement = document.querySelector("main");
     if (nextMainElement !== mainElement) {
         mainElementObserver?.disconnect();
@@ -1017,9 +1058,6 @@ async function observerCallback(keys) {
             else nowPlayingWidget.prepend(nowPlayingWidgetStarData[0]);
             addStarsListeners(nowPlayingWidgetStarData, getNowPlayingTrackUri);
             updateNowPlayingWidget();
-            if (settings.enableKeyboardShortcuts) {
-                getRegisterKeyboardShortcuts(keys)();
-            }
         }
     }
 
@@ -1060,22 +1098,24 @@ function scheduleAlbumStars() {
 function updateNowPlayingWidget() {
     if (!nowPlayingWidgetStarData) return;
 
-    const trackUri = Spicetify.Player.data.item.uri;
-    const isTrack = trackUri.includes("track");
+    const trackUri = getNowPlayingTrackUri();
+    const isTrack = typeof trackUri === "string" && trackUri.startsWith("spotify:track:");
 
     nowPlayingWidgetStarData[0].style.display = isTrack ? "flex" : "none";
+    if (!isTrack || !trackUri) return;
 
     const currentRating = getTrackRating(trackUri) ?? 0.0;
     setRating(nowPlayingWidgetStarData[1], currentRating, nowPlayingWidgetStarData[2]);
 }
 
-function shouldAddContextMenuOnFolders(uri) {
-    let uriObj = Spicetify.URI.fromString(uri[0]);
-    return uriObj.type === Spicetify.URI.Type.FOLDER;
+function shouldAddContextMenuOnFolders(uris: string[]) {
+    const uriObj = uris[0] ? Spicetify.URI.fromString(uris[0]) : null;
+    return uriObj?.type === Spicetify.URI.Type.FOLDER;
 }
 
-function shouldAddContextMenuOnPlaylists(uri) {
-    let uriObj = Spicetify.URI.fromString(uri[0]);
+function shouldAddContextMenuOnPlaylists(uris: string[]) {
+    const uriObj = uris[0] ? Spicetify.URI.fromString(uris[0]) : null;
+    if (!uriObj) return false;
     switch (uriObj.type) {
         case Spicetify.URI.Type.PLAYLIST:
         case Spicetify.URI.Type.PLAYLIST_V2:
@@ -1085,58 +1125,85 @@ function shouldAddContextMenuOnPlaylists(uri) {
 }
 
 async function loadRatings() {
-    ratings = {};
-    playlistNames = {};
-
-    playlistUris = getPlaylistUris();
+    const nextPlaylistUris = getPlaylistUris();
+    let nextRatedFolderUri = ratedFolderUri;
+    let nextPlaylistNames: Record<string, string> = {};
+    let playlistUrisChanged = false;
 
     // Scan the rated folder to:
     //   1. Resolve playlistNames (display names for notifications).
     //   2. Migrate users coming from the dynamic-scanning era (empty localStorage).
     const contents = await api.getContents();
-    const ratedFolder = ratedFolderUri
-        ? (findFolderByUri(contents, ratedFolderUri) ?? findFolderByName(contents, "Rated"))
+    const ratedFolder = nextRatedFolderUri
+        ? (findFolderByUri(contents, nextRatedFolderUri) ?? findFolderByName(contents, "Rated"))
         : findFolderByName(contents, "Rated");
 
     if (ratedFolder) {
-        ratedFolderUri = ratedFolder.uri as string;
+        nextRatedFolderUri = ratedFolder.uri as string;
 
         // Auto-register any playlists in the rated folder that have a valid
         // rating name but are not yet registered in playlistUris.
         let changed = false;
-        const allRegistered = new Set(Object.values(playlistUris).flat());
+        const allRegistered = new Set(Object.values(nextPlaylistUris).flat());
         for (const item of ratedFolder.items) {
             if (item.type !== "playlist") continue;
             if (allRegistered.has(item.uri)) continue;
             const parsed = parseRatingPlaylistName(item.name);
             if (!parsed) continue;
             const { rating, version } = parsed;
-            if (!playlistUris[rating]) {
-                playlistUris[rating] = [];
+            if (!nextPlaylistUris[rating]) {
+                nextPlaylistUris[rating] = [];
             }
-            while (playlistUris[rating].length <= version) {
-                playlistUris[rating].push(null as unknown as string);
-            }
-            playlistUris[rating][version] = item.uri;
-            playlistUris[rating] = playlistUris[rating].filter(Boolean);
+            // Insert at the intended version when it is present, otherwise
+            // append. Never allocate placeholder slots from an untrusted
+            // playlist suffix such as "4.5(900000000)".
+            const versionIndex = Math.min(Math.max(version - 1, 0), nextPlaylistUris[rating].length);
+            nextPlaylistUris[rating].splice(versionIndex, 0, item.uri);
             allRegistered.add(item.uri);
             changed = true;
         }
-        if (changed) {
-            savePlaylistUris();
-        }
-
-        playlistNames = getPlaylistNames(playlistUris, ratedFolder);
+        playlistUrisChanged = changed;
+        nextPlaylistNames = getPlaylistNames(nextPlaylistUris, ratedFolder);
     } else {
-        ratedFolderUri = null;
+        nextRatedFolderUri = null;
     }
 
-    const allPlaylistItems = await getAllPlaylistItems(playlistUris);
-    ratings = getRatingsByTrack(allPlaylistItems);
+    const allPlaylistItems = await getAllPlaylistItems(nextPlaylistUris);
+    const nextRatings = getRatingsByTrack(allPlaylistItems);
+
+    // Swap state only after every playlist has been read. A transient Spotify
+    // error must not make the extension behave as though all ratings vanished.
+    ratings = nextRatings;
+    playlistUris = nextPlaylistUris;
+    playlistNames = nextPlaylistNames;
+    ratedFolderUri = nextRatedFolderUri;
+    if (playlistUrisChanged) savePlaylistUris(nextPlaylistUris);
+}
+
+async function refreshRatings(): Promise<boolean> {
+    ratingsLoading = true;
+    try {
+        await loadRatings();
+        ratingsLoading = false;
+        scheduleTracklistUpdate();
+        updateNowPlayingWidget();
+        scheduleAlbumStars();
+        return true;
+    } catch (error) {
+        // Keep rating clicks disabled when the in-memory view could be stale.
+        console.error("Could not load Star Ratings playlists:", error);
+        api.showNotification("Could not load ratings. Check Spotify and try again.");
+        return false;
+    }
 }
 
 async function main() {
-    while (!Spicetify?.showNotification) {
+    const readyDeadline = Date.now() + 30000;
+    while (!Spicetify?.showNotification || !Spicetify?.Player?.addEventListener || !Spicetify?.Platform) {
+        if (Date.now() >= readyDeadline) {
+            console.error("Star Ratings did not start because Spicetify was not ready after 30 seconds");
+            return;
+        }
         await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
@@ -1146,7 +1213,7 @@ async function main() {
     // Restore the previously-saved rated folder URI so loadRatings can find the right folder.
     ratedFolderUri = getRatedFolderUri();
 
-    await loadRatings();
+    await refreshRatings();
 
     const keys = {
         "5.0": Spicetify.Keyboard.KEYS.NUMPAD_0,
@@ -1163,16 +1230,17 @@ async function main() {
 
     const registerKeyboardShortcuts = getRegisterKeyboardShortcuts(keys);
     const deregisterKeyboardShortcuts = getDeregisterKeyboardShortcuts(keys);
+    if (settings.enableKeyboardShortcuts) registerKeyboardShortcuts();
     const redrawNowPlayingStars = () => {
         if (nowPlayingWidgetStarData) nowPlayingWidgetStarData[0].remove();
         nowPlayingWidget = null;
-        observerCallback(keys);
+        void observerCallback(keys).catch((error) => console.error("Could not reposition now-playing stars:", error));
     };
 
     new Spicetify.Menu.Item("Star Ratings", true, () => {
         Spicetify.PopupModal.display({
             title: "Star Ratings",
-            content: SettingsUi({
+            content: Spicetify.React.createElement(SettingsUi, {
                 settings,
                 registerKeyboardShortcuts,
                 deregisterKeyboardShortcuts,
@@ -1180,17 +1248,21 @@ async function main() {
                 restoreTracklist,
                 redrawNowPlayingStars,
                 refreshWeightedShuffleButton,
-            }),
+            }) as unknown as Element,
             isLarge: true,
         });
     }).register();
 
-    mainElementObserver = new MutationObserver(() => {
-        scheduleTracklistUpdate();
+    mainElementObserver = new MutationObserver((records) => {
+        if (isTracklistMutationRelevant(records)) scheduleTracklistUpdate();
     });
 
     Spicetify.Player.addEventListener("songchange", () => {
-        const trackUri = Spicetify.Player.data.item.uri;
+        const trackUri = getNowPlayingTrackUri();
+        if (typeof trackUri !== "string" || !trackUri.startsWith("spotify:track:")) {
+            updateNowPlayingWidget();
+            return;
+        }
 
         const skip =
             (trackUri in ratings && settings.play === "onlyunrated") ||
@@ -1216,10 +1288,7 @@ async function main() {
         (uri) => {
             ratedFolderUri = uri[0];
             saveRatedFolderUri(ratedFolderUri);
-            ratingsLoading = true;
-            loadRatings().finally(() => {
-                ratingsLoading = false;
-            });
+            void refreshRatings();
         },
         shouldAddContextMenuOnFolders,
     ).register();
@@ -1234,7 +1303,7 @@ async function main() {
                     onClickCancel: () => {
                         Spicetify.PopupModal.hide();
                     },
-                    onClickCreate: async (trackCount) => {
+                    onClickCreate: async (trackCount: number) => {
                         Spicetify.PopupModal.hide();
                         api.showNotification("Creating weighted playlist...");
 
@@ -1269,11 +1338,16 @@ async function main() {
                         Spicetify.PopupModal.hide();
                         isSorting = true;
                         api.showNotification("Sorting...");
-                        sortPlaylistByRating(uri[0], ratings).finally(() => {
-                            isSorting = false;
-                        });
+                        void sortPlaylistByRating(uri[0], ratings)
+                            .catch((error) => {
+                                console.error("Could not sort playlist by rating:", error);
+                                api.showNotification("Could not sort playlist. Check Spotify and try again.");
+                            })
+                            .finally(() => {
+                                isSorting = false;
+                            });
                     },
-                }),
+                }) as unknown as Element,
             });
         },
         shouldAddContextMenuOnPlaylists,
@@ -1285,7 +1359,7 @@ async function main() {
             const playlistUri = uri[0];
 
             // Fetch folder contents fresh so we're always in-sync
-            api.getContents().then((contents) => {
+            void api.getContents().then((contents) => {
                 const ratedFolder = ratedFolderUri
                     ? (findFolderByUri(contents, ratedFolderUri) ?? findFolderByName(contents, "Rated"))
                     : findFolderByName(contents, "Rated");
@@ -1323,20 +1397,20 @@ async function main() {
 
                             api.showNotification(`Registered "${playlistName}" as rating ${toRatingString(rating)} (position ${version}).`);
 
-                            ratingsLoading = true;
-                            loadRatings().finally(() => {
-                                ratingsLoading = false;
-                            });
+                            void refreshRatings();
                         },
                     }),
                 });
+            }).catch((error) => {
+                console.error("Could not load library contents:", error);
+                api.showNotification("Could not load your playlists. Check Spotify and try again.");
             });
         },
         shouldAddContextMenuOnPlaylists,
     ).register();
 
-    const observer = new MutationObserver(() => {
-        scheduleObserverCallback(keys);
+    const observer = new MutationObserver((records) => {
+        if (isAppChromeMutationRelevant(records)) scheduleObserverCallback(keys);
     });
     await observerCallback(keys);
     scheduleAlbumStars();

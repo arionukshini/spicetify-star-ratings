@@ -11,15 +11,42 @@ export type CachedAlbumRating = {
 };
 
 type AlbumRatingCache = Record<string, CachedAlbumRating>;
+let albumRatingCache: AlbumRatingCache | null = null;
 
 function loadCache(): AlbumRatingCache {
+    if (albumRatingCache) return albumRatingCache;
+
     try {
         const value = api.getLocalStorageData(STORAGE_KEY);
         const parsed = value ? JSON.parse(value) : {};
-        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            albumRatingCache = {};
+            return albumRatingCache;
+        }
+
+        albumRatingCache = Object.fromEntries(
+            Object.entries(parsed).filter((entry): entry is [string, CachedAlbumRating] => {
+                const value = entry[1] as Partial<CachedAlbumRating> | null;
+                return (
+                    !!value &&
+                    typeof value.average === "number" &&
+                    Number.isFinite(value.average) &&
+                    value.average >= 0 &&
+                    value.average <= 5 &&
+                    typeof value.ratedTracks === "number" &&
+                    Number.isFinite(value.ratedTracks) &&
+                    typeof value.totalTracks === "number" &&
+                    Number.isFinite(value.totalTracks) &&
+                    typeof value.updatedAt === "number" &&
+                    Number.isFinite(value.updatedAt)
+                );
+            }),
+        );
+        return albumRatingCache;
     } catch (error) {
         console.warn("Could not read the local album-rating cache:", error);
-        return {};
+        albumRatingCache = {};
+        return albumRatingCache;
     }
 }
 
@@ -29,7 +56,8 @@ function saveCache(cache: AlbumRatingCache) {
             .filter(([, value]) => value && Number.isFinite(value.average) && Number.isFinite(value.updatedAt))
             .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
             .slice(0, MAX_ENTRIES);
-        api.setLocalStorageData(STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+        albumRatingCache = Object.fromEntries(entries);
+        api.setLocalStorageData(STORAGE_KEY, JSON.stringify(albumRatingCache));
     } catch (error) {
         console.warn("Could not save the local album-rating cache:", error);
     }

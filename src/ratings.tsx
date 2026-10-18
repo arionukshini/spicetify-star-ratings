@@ -33,12 +33,26 @@ export function findFolderByName(contents: Contents, name: string): Contents | u
  * Returns null if the name does not match.
  */
 export function parseRatingPlaylistName(name: string): { rating: number; version: number } | null {
+    const toSupportedRating = (value: string): number | null => {
+        const rating = Number(value);
+        return Number.isFinite(rating) && rating >= 0 && rating <= 5 && Number.isInteger(rating * 4) ? rating : null;
+    };
+
     // Base name with no suffix: "4.5"
     const baseMatch = name.match(/^(\d+(?:\.\d+)?)$/);
-    if (baseMatch) return { rating: parseFloat(baseMatch[1]), version: 1 };
+    if (baseMatch) {
+        const rating = toSupportedRating(baseMatch[1]);
+        return rating === null ? null : { rating, version: 1 };
+    }
     // Spillover suffix: "4.5(1)", "4.5(2)", …
     const overflowMatch = name.match(/^(\d+(?:\.\d+)?)\((\d+)\)$/);
-    if (overflowMatch) return { rating: parseFloat(overflowMatch[1]), version: parseInt(overflowMatch[2]) + 1 };
+    if (overflowMatch) {
+        const rating = toSupportedRating(overflowMatch[1]);
+        const suffix = Number(overflowMatch[2]);
+        return rating === null || !Number.isSafeInteger(suffix) || suffix >= Number.MAX_SAFE_INTEGER
+            ? null
+            : { rating, version: suffix + 1 };
+    }
     return null;
 }
 
@@ -97,7 +111,17 @@ export async function getAllPlaylistItems(playlistUris: PlaylistUris): Promise<P
             entries.push({ rating, playlistUri });
         }
     }
-    const trackArrays = await Promise.all(entries.map((e) => api.getPlaylistItems(e.playlistUri)));
+    const trackArrays: Track[][] = new Array(entries.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(4, entries.length);
+    await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+            while (nextIndex < entries.length) {
+                const index = nextIndex++;
+                trackArrays[index] = (await api.getPlaylistItems(entries[index].playlistUri)) as Track[];
+            }
+        }),
+    );
     return entries.map((e, i) => ({ ...e, tracks: trackArrays[i] }));
 }
 
@@ -135,14 +159,23 @@ export function getRatingsByTrack(allPlaylistItems: PlaylistItemsEntry[]): Ratin
         for (const track of tracks) {
             const trackUri = track.link ?? track.uri;
             const playlistItemId = getPlaylistItemId(track);
-            if (typeof trackUri !== "string" || !playlistItemId) {
+            const addedAt = new Date(track.addedAt);
+            if (
+                typeof trackUri !== "string" ||
+                !playlistItemId ||
+                !Number.isFinite(rating) ||
+                rating < 0 ||
+                rating > 5 ||
+                !Number.isInteger(rating * 4) ||
+                !Number.isFinite(addedAt.getTime())
+            ) {
                 console.warn("Skipping a rating playlist item without a track URI or playlist-item ID", track);
                 continue;
             }
 
             const entry: TimestampedRating = {
                 rating,
-                time: new Date(track.addedAt),
+                time: addedAt,
                 uid: playlistItemId,
                 playlistUri,
             };
@@ -301,7 +334,11 @@ export async function sortPlaylistByRating(playlistUri: string, ratings: Ratings
     // Use lowest-rated track as anchor, then insert tracks in descending-rating order before it.
     const anchor = sorted[sorted.length - 1];
 
-    for (let i = 0; i < sorted.length - 1; i++) {
-        await api.moveTracksBefore(playlistUri, [sorted[i]], anchor);
+    // One batched move per 50 tracks avoids thousands of round trips on large
+    // playlists while keeping each request comfortably sized.
+    const batchSize = 50;
+    const tracksToMove = sorted.slice(0, -1);
+    for (let i = 0; i < tracksToMove.length; i += batchSize) {
+        await api.moveTracksBefore(playlistUri, tracksToMove.slice(i, i + batchSize), anchor);
     }
 }

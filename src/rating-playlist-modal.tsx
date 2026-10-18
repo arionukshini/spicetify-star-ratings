@@ -24,10 +24,10 @@ export function RatingPlaylistModal({ playlistName, currentPlaylistUris, onClick
     const parsed = parseRatingPlaylistName(playlistName);
 
     const defaultRating: number = parsed?.rating ?? 5.0;
-    const [rating, setRating] = React.useState<number>(defaultRating);
+    const [rating, setRating] = React.useState(defaultRating);
 
     const nextFreeSlot = (currentPlaylistUris[rating] ?? []).length;
-    const [version, setVersion] = React.useState<number>(nextFreeSlot);
+    const [version, setVersion] = React.useState(nextFreeSlot);
 
     React.useEffect(() => {
         setVersion((currentPlaylistUris[rating] ?? []).length);

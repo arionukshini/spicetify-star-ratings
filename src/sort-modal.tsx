@@ -2,7 +2,18 @@ import "./sort-modal.css";
 
 const React = Spicetify.React;
 
-export function Button({ name, className, onButtonClick }) {
+interface ButtonProps {
+    name: string;
+    className: string;
+    onButtonClick: () => void;
+}
+
+interface SortModalProps {
+    onClickCancel: () => void;
+    onClickOK: () => void;
+}
+
+export function Button({ name, className, onButtonClick }: ButtonProps) {
     return (
         <button className={className} onClick={onButtonClick}>
             {name}
@@ -10,7 +21,7 @@ export function Button({ name, className, onButtonClick }) {
     );
 }
 
-export function SortModal({ onClickCancel, onClickOK }) {
+export function SortModal({ onClickCancel, onClickOK }: SortModalProps) {
     return (
         <div className="parent-div">
             <p>

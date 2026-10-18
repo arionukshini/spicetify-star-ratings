@@ -32,9 +32,25 @@ Add and manage personal star ratings in Spotify with Spicetify.
 
 ## Settings
 
-Settings, including optional half- and quarter-star song ratings, can be
-accessed from the menu at the top right.
-![Settings](imgs/settings.png)
+Open **Star Ratings** from Spotify's profile menu. Settings are grouped into
+Display, Rating behavior, Playback, and Data & shortcuts, and changes save
+automatically.
+
+<img src="imgs/settings.png" width="600" alt="Star Ratings display settings">
+
+### Duplicate-track sync
+
+When enabled, rating a Spotify track also rates unrated releases with the same
+ISRC. A matching release that already has a different latest rating is left
+alone; copies that still share the source track's latest rating continue to be
+updated together. Local files are not included because they do not have
+Spotify ISRCs.
+
+The **Check current track** button runs the same Spotify ISRC lookup without
+changing ratings and reports any other matching releases. It distinguishes
+Spotify finding only the current track from returning no tracks for that ISRC.
+
+<img src="imgs/settings-sync.png" width="600" alt="Duplicate-track sync and ISRC diagnostic settings">
 
 ## Implement List
 
