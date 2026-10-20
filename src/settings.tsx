@@ -32,6 +32,7 @@ type Threshold = "disabled" | HalfIncrementRating;
 
 export type Play = "all" | "onlyrated" | "onlyunrated";
 export type Scaling = { kind: "Linear" } | { kind: "Exponential"; base: number };
+export type AotyScoreType = "critic" | "user";
 
 export interface Settings {
     halfStarRatings: boolean;
@@ -51,6 +52,10 @@ export interface Settings {
     ratingToWeight: Scaling;
     play: Play;
     showWeightedShuffle: boolean;
+    showAotyAlbumScore: boolean;
+    aotyScoreType: AotyScoreType;
+    openAlbumsInAoty: boolean;
+    openArtistsInAoty: boolean;
 }
 
 const halfIncrementRatings: HalfIncrementRating[] = ["0.0", "0.5", "1.0", "1.5", "2.0", "2.5", "3.0", "3.5", "4.0", "4.5", "5.0"];
@@ -79,6 +84,10 @@ const defaultSettings: Settings = {
     ratingToWeight: { kind: "Linear" },
     play: "all",
     showWeightedShuffle: true,
+    showAotyAlbumScore: false,
+    aotyScoreType: "critic",
+    openAlbumsInAoty: false,
+    openArtistsInAoty: false,
 };
 
 export function getSettings(): Settings {
@@ -111,6 +120,15 @@ export function getSettings(): Settings {
     useBoolean("averageRatings");
     useBoolean("showExactRating");
     useBoolean("showWeightedShuffle");
+    useBoolean("showAotyAlbumScore");
+    useBoolean("openAlbumsInAoty");
+    useBoolean("openArtistsInAoty");
+
+    if (values.aotyScoreType === "critic" || values.aotyScoreType === "user") {
+        settings.aotyScoreType = values.aotyScoreType;
+    } else if ("aotyScoreType" in values) {
+        modified = true;
+    }
 
     if (typeof values.maxPlaylistItems === "number" && Number.isFinite(values.maxPlaylistItems)) {
         settings.maxPlaylistItems = Math.max(1, Math.min(10000, Math.floor(values.maxPlaylistItems)));

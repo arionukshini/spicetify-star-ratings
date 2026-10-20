@@ -142,6 +142,38 @@ function withAlbumTracks(album: any): any {
     };
 }
 
+function getSpotifyEntityId(uri: string, type: "album" | "artist"): string | null {
+    const match = uri.match(new RegExp(`(?:spotify:${type}:|open\\.spotify\\.com/${type}/)([A-Za-z0-9]+)`));
+    return match?.[1] ?? null;
+}
+
+export interface SpotifyAlbumMetadata {
+    name: string;
+    artists: string[];
+}
+
+export async function getAlbumMetadata(uri: string): Promise<SpotifyAlbumMetadata> {
+    const albumId = getSpotifyEntityId(uri, "album");
+    if (!albumId) throw new Error("Invalid Spotify album URI");
+
+    const album = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/albums/${encodeURIComponent(albumId)}`);
+    if (typeof album?.name !== "string" || !album.name.trim()) throw new Error("Spotify did not return album details");
+    const artists = Array.isArray(album?.artists)
+        ? album.artists.flatMap((artist: any) => (typeof artist?.name === "string" && artist.name.trim() ? [artist.name.trim()] : []))
+        : [];
+    if (!artists.length) throw new Error("Spotify did not return the album artist");
+    return { name: album.name.trim(), artists };
+}
+
+export async function getArtistName(uri: string): Promise<string> {
+    const artistId = getSpotifyEntityId(uri, "artist");
+    if (!artistId) throw new Error("Invalid Spotify artist URI");
+
+    const artist = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/artists/${encodeURIComponent(artistId)}`);
+    if (typeof artist?.name !== "string" || !artist.name.trim()) throw new Error("Spotify did not return artist details");
+    return artist.name.trim();
+}
+
 export async function getAlbum(uri: string) {
     const albumId = uri.replace(/^spotify:album:/, "");
     if (!albumId || albumId === uri) throw new Error("Invalid Spotify album URI");

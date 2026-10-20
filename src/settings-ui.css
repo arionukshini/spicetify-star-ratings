@@ -93,7 +93,7 @@
 
 .sr-settings-tabs {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 8px;
     padding: 7px;
     border: 1px solid var(--sr-border);
@@ -290,6 +290,7 @@
 .sr-settings-button:focus-visible,
 .sr-settings-select:focus-visible,
 .sr-settings-number:focus-visible,
+.sr-settings-text:focus-visible,
 .sr-settings-base input:focus-visible {
     outline: 2px solid #1ed760;
     outline-offset: 2px;
@@ -323,10 +324,57 @@
     text-align: right;
 }
 
+.sr-settings-text {
+    width: min(240px, 32vw);
+    min-width: 150px;
+    min-height: 34px;
+    padding: 0 10px;
+}
+
 .sr-settings-inline-control {
     display: flex;
     align-items: center;
     gap: 8px;
+}
+
+.sr-aoty-key-control {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+.sr-aoty-key-input-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.sr-aoty-key-saved {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--sr-subtle);
+    font-size: 10px;
+}
+
+.sr-aoty-key-saved span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #1ed760;
+}
+
+.sr-aoty-key-note {
+    padding: 0 2px 10px;
+    line-height: 1.5;
+}
+
+.sr-aoty-key-note a,
+.sr-settings-row-description a {
+    color: var(--spice-text);
+    text-decoration: underline;
+    text-underline-offset: 2px;
 }
 
 .sr-settings-base {
@@ -452,6 +500,27 @@
     text-align: right;
 }
 
+.sr-aoty-note {
+    padding: 0 2px 15px;
+}
+
+.starRatingsAotyScore {
+    margin-top: 3px;
+    color: var(--spice-subtext, rgba(var(--spice-rgb-text), 0.72));
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+}
+
+.starRatingsAotyScore.is-loading {
+    opacity: 0.68;
+}
+
+.starRatingsAotyScore.is-unavailable {
+    opacity: 0.58;
+    font-weight: 400;
+}
+
 @media (max-width: 720px) {
     .sr-settings {
         padding: 22px 18px 18px;
@@ -520,5 +589,14 @@
     .sr-settings-inline-control {
         flex-wrap: wrap;
         justify-content: flex-end;
+    }
+
+    .sr-aoty-key-control {
+        align-items: flex-start;
+    }
+
+    .sr-aoty-key-input-wrap,
+    .sr-aoty-key-input-wrap .sr-settings-text {
+        width: 100%;
     }
 }

@@ -1,4 +1,6 @@
 import * as api from "./api";
+import { getAotyAlbumRatings, makeAotySearchUrl } from "./aoty";
+import type { AotyAlbumRatings } from "./aoty";
 import { getCachedAlbumRating, saveCachedAlbumRating } from "./album-rating-cache";
 import { createStars, setRating, getMouseoverRating, getStarDataFromElement, toRatingString, StarData } from "./stars";
 import { Settings, getSettings, saveSettings, getPlaylistUris, savePlaylistUris, getRatedFolderUri, saveRatedFolderUri } from "./settings";
@@ -49,6 +51,10 @@ let nowPlayingWidget: Element | null = null;
 let albumId: string | null = null;
 let albumStarData: StarData | null = null;
 let albumRatingSummary: HTMLSpanElement | null = null;
+let albumAotyScoreLine: HTMLDivElement | null = null;
+let albumAotyScoreState: { albumId: string; status: "loading" | "loaded" | "unavailable"; ratings?: AotyAlbumRatings } | null = null;
+let albumAotyScoreGeneration = 0;
+let albumAotyMetadataRetries = 0;
 let albumRefreshGeneration = 0;
 let nowPlayingWidgetStarData: StarData | null = null;
 
@@ -301,6 +307,17 @@ function findAlbumHeader(): Element | null {
     );
 }
 
+function getAlbumMetadataFromPage(): api.SpotifyAlbumMetadata | null {
+    const header = findAlbumHeader();
+    if (!header) return null;
+
+    const name = header.querySelector("h1, .main-entityHeader-title, [data-testid='entityTitle']")?.textContent?.trim();
+    const artists = Array.from(header.querySelectorAll(".main-entityHeader-metaData a"))
+        .map((element) => element.textContent?.trim())
+        .filter((artist): artist is string => Boolean(artist));
+    return name && artists.length ? { name, artists } : null;
+}
+
 function ensureAlbumStars(): boolean {
     if (!isAlbumPage()) {
         if (albumStarData) albumStarData[0].style.display = "none";
@@ -334,20 +351,107 @@ function ensureAlbumStars(): boolean {
         albumRatingSummary.style.opacity = "0.9";
         albumRatingSummary.style.whiteSpace = "nowrap";
         albumStarData[0].appendChild(albumRatingSummary);
+
+        albumAotyScoreLine = document.createElement("div");
+        albumAotyScoreLine.className = "starRatingsAotyScore";
+        albumAotyScoreLine.setAttribute("role", "status");
+        albumAotyScoreLine.setAttribute("aria-live", "polite");
+        albumAotyScoreLine.style.display = "none";
     }
 
     // Put the rating between the title and album metadata. This avoids the
     // unstable action-bar classes that Spotify recently removed.
     const metadata = header.querySelector(".main-entityHeader-metaData");
-    if (metadata) {
-        if (albumStarData[0].parentElement !== header || albumStarData[0].nextElementSibling !== metadata) {
-            metadata.insertAdjacentElement("beforebegin", albumStarData[0]);
+    const nextHeaderElement = albumAotyScoreLine?.parentElement === header ? albumAotyScoreLine : metadata;
+    if (nextHeaderElement) {
+        if (albumStarData[0].parentElement !== header || albumStarData[0].nextElementSibling !== nextHeaderElement) {
+            header.insertBefore(albumStarData[0], nextHeaderElement);
         }
     } else if (albumStarData[0].parentElement !== header) {
         header.appendChild(albumStarData[0]);
     }
 
+    if (albumAotyScoreLine && (albumAotyScoreLine.parentElement !== header || albumStarData[0].nextElementSibling !== albumAotyScoreLine)) {
+        albumStarData[0].insertAdjacentElement("afterend", albumAotyScoreLine);
+    }
+
     return true;
+}
+
+function renderAlbumAotyScore() {
+    const scoreLine = albumAotyScoreLine;
+    if (!scoreLine) return;
+    if (!settings?.showAotyAlbumScore || !albumId) {
+        scoreLine.style.display = "none";
+        return;
+    }
+
+    scoreLine.style.display = "block";
+    scoreLine.classList.remove("is-loading", "is-unavailable");
+    if (!albumAotyScoreState || albumAotyScoreState.albumId !== albumId || albumAotyScoreState.status === "loading") {
+        scoreLine.textContent = "Loading AOTY score…";
+        scoreLine.classList.add("is-loading");
+        return;
+    }
+
+    if (albumAotyScoreState.status === "unavailable" || !albumAotyScoreState.ratings) {
+        scoreLine.textContent = "AOTY score unavailable";
+        scoreLine.classList.add("is-unavailable");
+        return;
+    }
+
+    const score = settings.aotyScoreType === "critic" ? albumAotyScoreState.ratings.criticScore : albumAotyScoreState.ratings.userScore;
+    if (score === null) {
+        scoreLine.textContent = `No ${settings.aotyScoreType} score listed on AOTY`;
+        scoreLine.classList.add("is-unavailable");
+        return;
+    }
+
+    const scoreLabel = settings.aotyScoreType === "critic" ? "Critic score" : "User score";
+    scoreLine.textContent = `${score}/100 · ${scoreLabel}`;
+    scoreLine.title = `Album of the Year ${scoreLabel.toLowerCase()}`;
+}
+
+function updateAlbumAotyScore() {
+    renderAlbumAotyScore();
+    if (!settings?.showAotyAlbumScore || !albumId || albumAotyScoreState?.albumId === albumId) return;
+
+    const currentAlbumId = albumId;
+    const generation = ++albumAotyScoreGeneration;
+    albumAotyScoreState = { albumId: currentAlbumId, status: "loading" };
+    renderAlbumAotyScore();
+
+    void (async () => {
+        let pageMetadataAvailable = false;
+        try {
+            // The album page already contains the exact title and artists.
+            // Read that first instead of relying on an extra Web API request
+            // that can fail on some Spotify client builds.
+            const pageMetadata = getAlbumMetadataFromPage();
+            pageMetadataAvailable = Boolean(pageMetadata);
+            const metadata = pageMetadata ?? await api.getAlbumMetadata(`spotify:album:${currentAlbumId}`);
+            const ratings = await getAotyAlbumRatings(metadata.name, metadata.artists, settings.aotyScoreType);
+            if (generation !== albumAotyScoreGeneration || albumId !== currentAlbumId) return;
+            albumAotyScoreState = ratings
+                ? { albumId: currentAlbumId, status: "loaded", ratings }
+                : { albumId: currentAlbumId, status: "unavailable" };
+        } catch (error) {
+            if (generation !== albumAotyScoreGeneration || albumId !== currentAlbumId) return;
+            console.warn("Could not load the AOTY album score:", error);
+            albumAotyScoreState = { albumId: currentAlbumId, status: "unavailable" };
+            // Spotify sometimes mounts the header before its title/artist
+            // links. Retry the metadata read once after the page settles.
+            if (!pageMetadataAvailable && albumAotyMetadataRetries < 1) {
+                albumAotyMetadataRetries++;
+                window.setTimeout(() => {
+                    if (albumId !== currentAlbumId || !settings?.showAotyAlbumScore || albumAotyScoreState?.status !== "unavailable") return;
+                    albumAotyScoreState = null;
+                    updateAlbumStars();
+                }, 1200);
+            }
+        }
+        renderAlbumAotyScore();
+    })();
 }
 
 function getRenderedAlbumRatingDetails() {
@@ -1069,8 +1173,15 @@ function updateAlbumStars() {
     const routeChanged = albumId !== nextAlbumId;
     albumId = nextAlbumId;
 
+    if (routeChanged) {
+        albumAotyScoreGeneration++;
+        albumAotyScoreState = null;
+        albumAotyMetadataRetries = 0;
+    }
+
     if (!albumId) {
         if (albumStarData) albumStarData[0].style.display = "none";
+        renderAlbumAotyScore();
         return;
     }
 
@@ -1080,7 +1191,21 @@ function updateAlbumStars() {
 
     // The header is filled from the persistent cache right away and then from
     // the visible album rows as Spotify finishes rendering them.
-    if (ensureAlbumStars()) updateAlbumRating();
+    if (ensureAlbumStars()) {
+        updateAlbumRating();
+        updateAlbumAotyScore();
+    }
+}
+
+function refreshAlbumAotyScore(force = false) {
+    if (force) {
+        albumAotyScoreGeneration++;
+        albumAotyScoreState = null;
+        albumAotyMetadataRetries = 0;
+    } else if (settings?.showAotyAlbumScore && albumAotyScoreState?.status === "unavailable") {
+        albumAotyScoreState = null;
+    }
+    updateAlbumStars();
 }
 
 function scheduleAlbumStars() {
@@ -1122,6 +1247,92 @@ function shouldAddContextMenuOnPlaylists(uris: string[]) {
             return true;
     }
     return false;
+}
+
+function isAotySupportedUri(uri: string | undefined, type: "album" | "artist"): uri is string {
+    if (typeof uri !== "string") return false;
+    const prefix = `spotify:${type}:`;
+    if (!uri.startsWith(prefix) || !/^[A-Za-z0-9]+$/.test(uri.slice(prefix.length))) return false;
+    try {
+        return type === "album" ? Spicetify.URI.isAlbum(uri) : Spicetify.URI.isArtist(uri);
+    } catch {
+        return true;
+    }
+}
+
+function shouldAddOpenAlbumInAoty(uris: string[]) {
+    return Boolean(settings?.openAlbumsInAoty && isAotySupportedUri(uris[0], "album"));
+}
+
+function shouldAddOpenArtistInAoty(uris: string[]) {
+    return Boolean(settings?.openArtistsInAoty && isAotySupportedUri(uris[0], "artist"));
+}
+
+function openAotyInSystemBrowser(url: string) {
+    try {
+        const safeUrl = new URL(url);
+        if (safeUrl.origin !== "https://www.albumoftheyear.org") throw new Error("Unexpected AOTY destination");
+        // Run directly in the ContextMenu click handler so Spotify can hand
+        // the link to the system browser while the user gesture is active.
+        // Spotify can hand this URL to Chrome and still return null from
+        // window.open, so the return value is not a reliable blocked signal.
+        window.open(safeUrl.toString(), "_blank");
+        return true;
+    } catch (error) {
+        console.warn("Could not open the AOTY page:", error);
+        api.showNotification("Could not open the AOTY page.");
+        return false;
+    }
+}
+
+function getVisibleAotySearchQuery(uri: string, type: "album" | "artist"): string {
+    const id = uri.slice(`spotify:${type}:`.length);
+    const pageMatch = Spicetify.Platform?.History?.location?.pathname?.match(new RegExp(`^/${type}/([^/]+)`));
+    const isCurrentEntity = pageMatch?.[1] === id;
+    const header = isCurrentEntity
+        ? type === "album"
+            ? findAlbumHeader()
+            : document.querySelector("main .main-entityHeader-headerText")
+        : null;
+
+    if (header) {
+        const title = header.querySelector("h1, .main-entityHeader-title, [data-testid='entityTitle']")?.textContent?.trim();
+        if (title) {
+            if (type === "album") {
+                const artists = Array.from(header.querySelectorAll(".main-entityHeader-metaData a"))
+                    .map((element) => element.textContent?.trim())
+                    .filter((name): name is string => Boolean(name));
+                return [title, ...artists].join(" ");
+            }
+            return title;
+        }
+    }
+
+    // For menus opened on a card rather than the current page, use its visible
+    // Spotify link text when available; the URI is still a safe last-resort
+    // search term and is better than failing to open anything.
+    const link = document.querySelector<HTMLAnchorElement>(`a[href*='/${type}/${id}']`);
+    const visibleText = link?.getAttribute("aria-label")?.trim() || link?.textContent?.trim();
+    return visibleText || `${type} ${id}`;
+}
+
+function openAlbumInAoty(uri: string) {
+    const uriId = uri.slice("spotify:album:".length);
+    // Album score lookup already resolves and caches the exact AOTY URL. Reuse
+    // it when present; otherwise open search immediately while the menu click
+    // still has browser user activation (network lookups here block popups).
+    const matchedUrl = albumId === uriId && albumAotyScoreState?.albumId === uriId
+        ? albumAotyScoreState.ratings?.url
+        : undefined;
+    const query = getVisibleAotySearchQuery(uri, "album");
+    openAotyInSystemBrowser(matchedUrl ?? makeAotySearchUrl(query, "albums"));
+}
+
+function openArtistInAoty(uri: string) {
+    const query = getVisibleAotySearchQuery(uri, "artist");
+    // The public artist-search proxy is currently returning upstream 403s.
+    // Opening AOTY's own search page is reliable and avoids a dead-end toast.
+    openAotyInSystemBrowser(makeAotySearchUrl(query, "artists"));
 }
 
 async function loadRatings() {
@@ -1248,6 +1459,7 @@ async function main() {
                 restoreTracklist,
                 redrawNowPlayingStars,
                 refreshWeightedShuffleButton,
+                refreshAlbumAotyScore,
             }) as unknown as Element,
             isLarge: true,
         });
@@ -1282,6 +1494,26 @@ async function main() {
     Spicetify.Platform.History.listen(() => {
         scheduleAlbumStars();
     });
+
+    new Spicetify.ContextMenu.Item(
+        "Open album in AOTY",
+        (uris) => {
+            const uri = uris[0];
+            if (isAotySupportedUri(uri, "album")) openAlbumInAoty(uri);
+        },
+        shouldAddOpenAlbumInAoty,
+        "external-link",
+    ).register();
+
+    new Spicetify.ContextMenu.Item(
+        "Open artist in AOTY",
+        (uris) => {
+            const uri = uris[0];
+            if (isAotySupportedUri(uri, "artist")) openArtistInAoty(uri);
+        },
+        shouldAddOpenArtistInAoty,
+        "external-link",
+    ).register();
 
     new Spicetify.ContextMenu.Item(
         "Use as Rated folder",

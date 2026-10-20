@@ -1,6 +1,8 @@
 import * as api from "./api";
 import { playlistUris } from "./app";
 import { getAllPlaylistItems } from "./ratings";
+import { getAotyApiKey, saveAotyApiKey } from "./aoty-settings";
+import { testAotyApiKey } from "./aoty";
 import { saveSettings } from "./settings";
 import type { Scaling, Settings as SettingsConfig } from "./settings";
 import { getNowPlayingTrackUri } from "./utils/utils";
@@ -10,7 +12,7 @@ const React = Spicetify.React;
 
 type BooleanSettingKey = { [Key in keyof SettingsConfig]: SettingsConfig[Key] extends boolean ? Key : never }[keyof SettingsConfig];
 type StringSettingKey = { [Key in keyof SettingsConfig]: SettingsConfig[Key] extends string ? Key : never }[keyof SettingsConfig];
-type TabId = "display" | "ratings" | "playback" | "data";
+type TabId = "display" | "ratings" | "playback" | "data" | "aoty";
 
 interface SettingsUiProps {
     settings: SettingsConfig;
@@ -20,6 +22,7 @@ interface SettingsUiProps {
     restoreTracklist: () => void;
     redrawNowPlayingStars: () => void;
     refreshWeightedShuffleButton: () => void;
+    refreshAlbumAotyScore: (force?: boolean) => void;
 }
 
 const tabs: Array<{ id: TabId; label: string; description: string }> = [
@@ -27,6 +30,7 @@ const tabs: Array<{ id: TabId; label: string; description: string }> = [
     { id: "ratings", label: "Rating behavior", description: "How ratings are saved" },
     { id: "playback", label: "Playback", description: "Queues & weighted play" },
     { id: "data", label: "Data & shortcuts", description: "Exports & quick controls" },
+    { id: "aoty", label: "AOTY", description: "Scores & quick links" },
 ];
 
 function SettingCard({ title, description, children, className = "" }: {
@@ -96,13 +100,14 @@ function ToggleRow({ settings, field, title, description, onChange }: {
     );
 }
 
-function SelectRow({ settings, field, title, description, options, onChange }: {
+function SelectRow({ settings, field, title, description, options, onChange, disabled = false }: {
     settings: SettingsConfig;
     field: StringSettingKey;
     title: string;
     description?: string;
     options: Record<string, string>;
     onChange?: () => void;
+    disabled?: boolean;
 }) {
     const [value, setValue] = React.useState(settings[field]);
 
@@ -116,7 +121,7 @@ function SelectRow({ settings, field, title, description, options, onChange }: {
 
     return (
         <SettingRow title={title} description={description}>
-            <select className="sr-settings-select" value={value} onChange={change} aria-label={title}>
+            <select className="sr-settings-select" value={value} onChange={change} aria-label={title} disabled={disabled}>
                 {Object.entries(options).map(([label, optionValue]) => <option key={optionValue} value={optionValue}>{label}</option>)}
             </select>
         </SettingRow>
@@ -162,6 +167,85 @@ function NumberRow({ settings, title, description, field, min, max, step }: {
             />
         </SettingRow>
     );
+}
+
+function AotyApiKeyRow({ refreshAlbumAotyScore }: { refreshAlbumAotyScore: (force?: boolean) => void }) {
+    const [draft, setDraft] = React.useState("");
+    const [visible, setVisible] = React.useState(false);
+    const [hasKey, setHasKey] = React.useState(Boolean(getAotyApiKey()));
+    const [status, setStatus] = React.useState("");
+    const [testing, setTesting] = React.useState(false);
+
+    function save() {
+        const key = draft.trim();
+        if (!key) return;
+        if (!saveAotyApiKey(key)) {
+            setStatus("Could not save the API key in local Spicetify storage.");
+            return;
+        }
+        setDraft("");
+        setHasKey(true);
+        setStatus("API key saved locally.");
+        refreshAlbumAotyScore(true);
+    }
+
+    function clear() {
+        if (!saveAotyApiKey("")) {
+            setStatus("Could not clear the saved API key.");
+            return;
+        }
+        setDraft("");
+        setHasKey(false);
+        setStatus("Saved API key cleared.");
+        refreshAlbumAotyScore(true);
+    }
+
+    async function testKey() {
+        setTesting(true);
+        setStatus("Testing album search and score details…");
+        try {
+            setStatus(await testAotyApiKey());
+        } catch {
+            setStatus("The Parse API test failed unexpectedly. Check the connection and try again.");
+        } finally {
+            setTesting(false);
+        }
+    }
+
+    return <>
+        <SettingRow
+            title="Parse API key (optional)"
+            description={<>Used for album search and score details. Without a key, the extension tries the community score source. Create an account and API key on <a href="https://parse.bot/settings" target="_blank" rel="noreferrer">Parse settings</a>.</>}
+        >
+            <div className="sr-aoty-key-control">
+                <div className="sr-aoty-key-input-wrap">
+                    <input
+                        className="sr-settings-text"
+                        type={visible ? "text" : "password"}
+                        value={draft}
+                        placeholder={hasKey ? "Saved — enter to replace" : "Paste API key"}
+                        aria-label="Parse API key"
+                        autoComplete="off"
+                        spellCheck={false}
+                        onChange={(event) => setDraft(event.target.value)}
+                        onKeyDown={(event) => { if (event.key === "Enter") save(); }}
+                    />
+                    <button className="sr-settings-button sr-settings-button-secondary" type="button" onClick={() => setVisible(!visible)} aria-label={visible ? "Hide API key" : "Show API key"}>
+                        {visible ? "Hide" : "Show"}
+                    </button>
+                </div>
+                <div className="sr-settings-inline-control">
+                    <button className="sr-settings-button" type="button" onClick={save} disabled={!draft.trim()}>Save key</button>
+                    <button className="sr-settings-button sr-settings-button-secondary" type="button" onClick={() => void testKey()} disabled={!hasKey || testing} title="Tests album search and score details; up to two successful API credits.">{testing ? "Testing…" : "Test key"}</button>
+                    <button className="sr-settings-button sr-settings-button-secondary" type="button" onClick={clear} disabled={!hasKey}>Clear</button>
+                </div>
+                {hasKey && <span className="sr-aoty-key-saved"><span /> Key saved</span>}
+            </div>
+        </SettingRow>
+        <p className="sr-settings-note sr-aoty-key-note" aria-live="polite">
+            {status || "Stored in local Spicetify storage and sent to Parse only in the X-API-Key request header. It is not included in settings or rating exports. The fallback can use up to two credits per uncached album."}
+        </p>
+    </>;
 }
 
 function ScalingRow({ settings }: { settings: SettingsConfig }) {
@@ -286,7 +370,7 @@ async function copyRatings() {
     }
 }
 
-function SettingsContent({ settings, tab, registerKeyboardShortcuts, deregisterKeyboardShortcuts, updateTracklist, restoreTracklist, redrawNowPlayingStars, refreshWeightedShuffleButton }: SettingsUiProps & { tab: TabId }) {
+function SettingsContent({ settings, tab, registerKeyboardShortcuts, deregisterKeyboardShortcuts, updateTracklist, restoreTracklist, redrawNowPlayingStars, refreshWeightedShuffleButton, refreshAlbumAotyScore }: SettingsUiProps & { tab: TabId }) {
     const keyboardChanged = () => settings.enableKeyboardShortcuts ? registerKeyboardShortcuts() : deregisterKeyboardShortcuts();
     const playlistStarsChanged = () => settings.showPlaylistStars ? updateTracklist() : restoreTracklist();
     const nowPlayingPositionChanged = () => redrawNowPlayingStars();
@@ -337,6 +421,23 @@ function SettingsContent({ settings, tab, registerKeyboardShortcuts, deregisterK
             <SettingCard title="Compatibility" description="Optional workarounds for specific Spotify playback behavior.">
                 <ToggleRow settings={settings} field="reEnqueueWorkaround" title="Re-enqueue remote-play workaround" description="After a short delay, re-add a track if Spotify drops it during remote playback." />
             </SettingCard>
+        </>;
+    }
+
+    if (tab === "aoty") {
+        return <>
+            <SettingCard title="Album of the Year score" description="Show the selected AOTY rating directly beneath your album stars.">
+                <ToggleRow settings={settings} field="showAotyAlbumScore" title="Show AOTY score on album pages" description="Looks up the album’s score and displays it in a 0–100 format, such as 93/100." onChange={refreshAlbumAotyScore} />
+                <SelectRow settings={settings} field="aotyScoreType" title="Score to display" description="Choose which AOTY score appears. If that score is missing for an album, no other score is substituted." options={{ "Critic score": "critic", "User score": "user" }} disabled={!settings.showAotyAlbumScore} onChange={() => refreshAlbumAotyScore(true)} />
+            </SettingCard>
+            <SettingCard title="Open pages in AOTY" description="Adds an Album of the Year item to the Spotify three-dot menu for each enabled page type.">
+                <ToggleRow settings={settings} field="openAlbumsInAoty" title="Enable for album pages" description="Add “Open album in AOTY” to album menus." />
+                <ToggleRow settings={settings} field="openArtistsInAoty" title="Enable for artist pages" description="Add “Open artist in AOTY” to artist menus." />
+            </SettingCard>
+            <SettingCard title="Score lookup fallback" description="Optionally add your own Parse key so album scores can still load when the community service is blocked or unavailable.">
+                <AotyApiKeyRow refreshAlbumAotyScore={refreshAlbumAotyScore} />
+            </SettingCard>
+            <p className="sr-settings-note sr-aoty-note">AOTY lookups require an internet connection and send only the public album or artist name to the score provider—never Spotify account data. Without a key, scores use the no-key community API; if both sources fail, scores stay unavailable and menu links fall back to AOTY search.</p>
         </>;
     }
 

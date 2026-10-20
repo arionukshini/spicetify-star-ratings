@@ -23,6 +23,8 @@ Add and manage personal star ratings in Spotify with Spicetify.
   one quarter of the fifth star, rather than rounding it to a half star.
 - Existing song-rating settings are retained, including the optional
   quarter-star input mode.
+- Optional Album of the Year critic or user scores on album pages, plus album
+  and artist links in Spotify's three-dot menus.
 
 ## Screenshots
 
@@ -33,8 +35,8 @@ Add and manage personal star ratings in Spotify with Spicetify.
 ## Settings
 
 Open **Star Ratings** from Spotify's profile menu. Settings are grouped into
-Display, Rating behavior, Playback, and Data & shortcuts, and changes save
-automatically.
+Display, Rating behavior, Playback, Data & shortcuts, and AOTY, and changes
+save automatically.
 
 <img src="imgs/settings.png" width="600" alt="Star Ratings display settings">
 
@@ -52,6 +54,30 @@ Spotify finding only the current track from returning no tracks for that ISRC.
 
 <img src="imgs/settings-sync.png" width="600" alt="Duplicate-track sync and ISRC diagnostic settings">
 
+### Album of the Year (AOTY)
+
+The **AOTY** settings tab can show an album's critic or user score below your
+personal album stars, formatted out of 100 (for example, **93/100**). It can
+also add **Open album in AOTY** and **Open artist in AOTY** to the matching
+Spotify three-dot menus. Each feature is independently opt-in.
+
+Without a Parse key, score lookup uses the no-key community [AOTY API](https://aoty.prigoana.com/).
+You can optionally add a Parse API key from your [Parse settings page](https://parse.bot/settings)
+in the AOTY settings tab. When a key is saved, Parse is tried first for album
+matching and score details; the community API remains a fallback. Album menu
+links use the exact page found by the score lookup when available. The
+**Test key** button checks both album search and score details.
+The key is stored in local Spicetify storage and sent only to Parse in its
+`X-API-Key` header; it is not part of settings or rating exports. Lookups send
+the public album title and artist name(s), not Spotify account data. A normal
+uncached lookup uses two Parse credits (search and score details); if title-only
+search cannot identify a match, one combined-query retry may use one extra
+credit. Results are cached in memory. If
+both sources are unavailable, the extension shows that the score could not be
+loaded; album menu links reuse the matched page when available and otherwise
+open AOTY search. Artist menu links open AOTY search. A missing critic or user
+score is not substituted with the other score.
+
 ## Implement List
 
 - [x] option to play songs with a minimum rating
@@ -63,7 +89,8 @@ Spotify finding only the current track from returning no tracks for that ISRC.
 - [x] album ratings averaged from rated songs
 - [] ratings for local files
 - [] ratings for playlists option (maybe)
-- [] link on album for aoty album page
+- [x] optional AOTY critic/user score on album pages
+- [x] optional AOTY album and artist links in Spotify context menus
 
 ## Weighted Playback
 - Always keeps one weighted random track in queue.
